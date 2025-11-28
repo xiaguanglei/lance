@@ -26,6 +26,8 @@ pub mod azure;
 pub mod gcp;
 #[cfg(feature = "goosefs")]
 pub mod goosefs;
+#[cfg(feature = "hdfs")]
+pub mod hdfs;
 #[cfg(feature = "huggingface")]
 pub mod huggingface;
 pub mod local;
@@ -403,6 +405,8 @@ impl Default for ObjectStoreRegistry {
         providers.insert("hf".into(), Arc::new(huggingface::HuggingfaceStoreProvider));
         #[cfg(feature = "tos")]
         providers.insert("tos".into(), Arc::new(tos::TosStoreProvider));
+        #[cfg(feature = "hdfs")]
+        providers.insert("hdfs".into(), Arc::new(hdfs::HdfsStoreProvider));
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),
