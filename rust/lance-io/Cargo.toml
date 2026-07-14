@@ -70,7 +70,7 @@ name = "scheduler"
 harness = false
 
 [features]
-default = ["aws", "azure", "gcp"]
+default = ["aws", "azure", "gcp", "hdfs", "hdfs-jni", "qbfs"]
 metrics = ["dep:metrics"]
 gcs-test = []
 goosefs-test = []
@@ -102,6 +102,7 @@ tos = ["dep:opendal", "opendal/services-tos", "dep:object_store_opendal"]
 tos-test = ["tos"]
 hdfs = ["dep:opendal", "opendal/services-hdfs-native", "dep:object_store_opendal"]
 hdfs-jni = ["dep:opendal", "opendal/services-hdfs", "dep:object_store_opendal"]
+qbfs = ["dep:opendal", "opendal/services-hdfs", "dep:object_store_opendal"]
 test-util = []
 
 [lints]

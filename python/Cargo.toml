@@ -97,6 +97,7 @@ lance-io-azure = ["lance-io/azure"]
 lance-io-gcp = ["lance-io/gcp"]
 hdfs = ["lance-io/hdfs"]
 hdfs-jni = ["lance-io/hdfs-jni"]
+qbfs = ["lance-io/qbfs"]
 
 [profile.ci]
 debug = "line-tables-only"
@@ -114,3 +115,4 @@ incremental = false
 
 [lints.clippy]
 disallowed_macros = "deny"
+
