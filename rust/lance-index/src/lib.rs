@@ -10,6 +10,8 @@
 //! API stability is not guaranteed.
 //! </section>
 
+#![recursion_limit = "256"]
+
 use crate::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use crate::mem_wal::MEM_WAL_INDEX_NAME;
 use serde::{Deserialize, Serialize};

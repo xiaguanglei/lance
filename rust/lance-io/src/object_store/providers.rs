@@ -28,6 +28,12 @@ pub mod gcp;
 pub mod goosefs;
 #[cfg(feature = "hdfs")]
 pub mod hdfs;
+#[cfg(all(feature = "hdfs", feature = "hdfs-jni"))]
+compile_error!(
+    "Features `hdfs` and `hdfs-jni` are mutually exclusive.      Use `hdfs` for the pure-Rust HDFS client (hdfs-native),      or `hdfs-jni` for the JNI-based client (libhdfs via Java).      Both register as the `hdfs://` scheme provider."
+);
+#[cfg(feature = "hdfs-jni")]
+pub mod hdfs_jni;
 #[cfg(feature = "huggingface")]
 pub mod huggingface;
 pub mod local;
@@ -407,6 +413,11 @@ impl Default for ObjectStoreRegistry {
         providers.insert("tos".into(), Arc::new(tos::TosStoreProvider));
         #[cfg(feature = "hdfs")]
         providers.insert("hdfs".into(), Arc::new(hdfs::HdfsStoreProvider));
+        #[cfg(feature = "hdfs-jni")]
+        providers.insert(
+            "hdfs".into(),
+            Arc::new(hdfs_jni::HdfsJniStoreProvider),
+        );
         Self {
             providers: RwLock::new(providers),
             active_stores: RwLock::new(HashMap::new()),

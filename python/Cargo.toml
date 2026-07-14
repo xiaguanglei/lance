@@ -56,7 +56,7 @@ lance-index = { path = "../rust/lance-index", features = [
     "tokenizer-lindera",
     "tokenizer-jieba",
 ] }
-lance-io = { path = "../rust/lance-io", features = ["metrics"] }
+lance-io = { path = "../rust/lance-io", default-features = false, features = ["metrics"] }
 lance-linalg = { path = "../rust/lance-linalg" }
 lance-namespace = { path = "../rust/lance-namespace" }
 lance-namespace-impls = { path = "../rust/lance-namespace-impls", features = ["rest", "rest-adapter", "dir-goosefs"] }
@@ -86,10 +86,17 @@ tracing = { version = "0.1" }
 bytes = "1.11.1"
 
 [features]
-default = ["extension-module"]
+default = ["extension-module", "lance-io-aws", "lance-io-azure", "lance-io-gcp", "hdfs"]
 datagen = ["lance-datagen"]
 extension-module = ["pyo3/extension-module"]
 fp16kernels = ["lance/fp16kernels"]
+
+# Forward object-store provider features to `lance-io`.
+lance-io-aws = ["lance-io/aws"]
+lance-io-azure = ["lance-io/azure"]
+lance-io-gcp = ["lance-io/gcp"]
+hdfs = ["lance-io/hdfs"]
+hdfs-jni = ["lance-io/hdfs-jni"]
 
 [profile.ci]
 debug = "line-tables-only"

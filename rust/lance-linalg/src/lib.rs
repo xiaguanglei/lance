@@ -5,6 +5,7 @@
 
 #![deny(clippy::unused_async)]
 #![cfg_attr(target_arch = "loongarch64", feature(stdarch_loongarch))]
+#![recursion_limit = "256"]
 
 use arrow_schema::ArrowError;
 

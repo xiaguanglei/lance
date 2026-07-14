@@ -101,6 +101,7 @@ huggingface = ["dep:opendal", "opendal/services-huggingface", "dep:object_store_
 tos = ["dep:opendal", "opendal/services-tos", "dep:object_store_opendal"]
 tos-test = ["tos"]
 hdfs = ["dep:opendal", "opendal/services-hdfs-native", "dep:object_store_opendal"]
+hdfs-jni = ["dep:opendal", "opendal/services-hdfs", "dep:object_store_opendal"]
 test-util = []
 
 [lints]

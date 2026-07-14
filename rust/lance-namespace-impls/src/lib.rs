@@ -71,6 +71,8 @@
 //! # }
 //! ```
 
+#![recursion_limit = "256"]
+
 use std::collections::HashSet;
 
 use lance_namespace::NamespaceError;

@@ -15,6 +15,8 @@
 //! See [`error::ErrorCode`] for the list of error codes and
 //! [`error::NamespaceError`] for the error types.
 
+#![recursion_limit = "256"]
+
 pub mod compat;
 pub mod error;
 pub mod namespace;

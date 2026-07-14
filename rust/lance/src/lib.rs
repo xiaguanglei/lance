@@ -77,6 +77,7 @@
 //! ```
 //!
 
+#![recursion_limit = "256"]
 use arrow_schema::DataType;
 use dataset::builder::DatasetBuilder;
 pub use lance_core::datatypes;
