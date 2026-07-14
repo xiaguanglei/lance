@@ -778,6 +778,21 @@ impl ObjectStore {
         self.is_local() && self.store_prefix == self.scheme
     }
 
+    /// Returns true if this storage backend requires safe (temp-then-rename)
+    /// writes to avoid truncation from async close() semantics.
+    ///
+    /// HDFS and QBFS backends may return from `close()` before data is fully
+    /// flushed to durable storage. Writing to a temp path then atomically
+    /// renaming prevents readers from seeing truncated files.
+    pub fn needs_safe_write(&self) -> bool {
+        // Escape hatch when the backend cannot rename/copy (e.g. some QBFS builds).
+        // Set LANCE_DISABLE_SAFE_WRITE=1 to write directly to the final path.
+        if std::env::var_os("LANCE_DISABLE_SAFE_WRITE").is_some() {
+            return false;
+        }
+        matches!(self.scheme.as_str(), "hdfs" | "hdfs-jni" | "qbfs")
+    }
+
     pub fn is_cloud(&self) -> bool {
         if self.is_local() || self.scheme == "memory" || self.scheme == "shared-memory" {
             return false;
@@ -1025,7 +1040,34 @@ impl ObjectStore {
                     Arc::new(self.io_tracker.clone()),
                 )))
             }
-            _ => Ok(Box::new(ObjectWriter::new(self, path).await?)),
+            _ => {
+                if self.needs_safe_write() {
+                    // HDFS/QBFS: write to temp path then atomically rename.
+                    // This prevents readers from seeing truncated files when
+                    // HDFS close() returns before block finalization.
+                    let temp_path = self.make_temp_write_path(path)?;
+                    Ok(Box::new(
+                        ObjectWriter::new_with_options(self, &temp_path, Some(path)).await?,
+                    ))
+                } else {
+                    Ok(Box::new(ObjectWriter::new(self, path).await?))
+                }
+            }
+        }
+    }
+
+    /// Generate a unique temp path for safe writes.
+    pub fn make_temp_write_path(&self, final_path: &Path) -> Result<Path> {
+        let suffix: u64 = rand::random();
+        let filename = final_path.filename().unwrap_or("tmp");
+        let temp_filename = format!(".tmp_{}_{:016x}", filename, suffix);
+        let final_str = final_path.as_ref();
+        // Insert the temp prefix before the filename component
+        if let Some(last_slash) = final_str.rfind('/') {
+            let parent = &final_str[..last_slash];
+            Ok(Path::from(format!("{}/{}", parent, temp_filename)))
+        } else {
+            Ok(Path::from(temp_filename))
         }
     }
 

@@ -87,7 +87,12 @@ pub(crate) fn initial_upload_size() -> usize {
 /// This implements the `AsyncWrite` trait.
 pub struct ObjectWriter {
     state: UploadState,
+    /// The path being written to (may be a temp path if using safe writes).
     path: Arc<Path>,
+    /// If set, the writer will rename `path` → `final_path` on shutdown.
+    final_path: Option<Arc<Path>>,
+    /// The underlying object store, used for the rename operation.
+    store: Arc<dyn ObjectStore>,
     cursor: usize,
     buffer: Vec<u8>,
     // TODO: use constant size to support R2
@@ -291,10 +296,26 @@ impl UploadState {
 
 impl ObjectWriter {
     pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
+        Self::new_with_options(object_store, path, None).await
+    }
+
+    /// Creates a new ObjectWriter that writes to `path`.
+    ///
+    /// If `final_path` is provided, the writer will write all data to `path`
+    /// (the temp path), and on `shutdown()` it will rename `path` → `final_path`.
+    /// This provides atomic writes for storage backends (e.g., HDFS/QBFS) where
+    /// `close()` may return before data is fully flushed.
+    pub async fn new_with_options(
+        object_store: &LanceObjectStore,
+        path: &Path,
+        final_path: Option<&Path>,
+    ) -> Result<Self> {
         Ok(Self {
             state: UploadState::Started(object_store.inner.clone()),
             cursor: 0,
             path: Arc::new(path.clone()),
+            final_path: final_path.map(|p| Arc::new(p.clone())),
+            store: object_store.inner.clone(),
             buffer: Vec::with_capacity(initial_upload_size()),
             use_constant_size_upload_parts: object_store.use_constant_size_upload_parts,
         })
@@ -625,11 +646,30 @@ impl Writer for ObjectWriter {
         // failure from this writer already names the path, and stringifying it
         // would flatten the object store error out of the source chain.
         AsyncWriteExt::shutdown(self).await?;
-        if let UploadState::Done(result) = &self.state {
-            Ok(result.clone())
+        let result = if let UploadState::Done(result) = &self.state {
+            result.clone()
         } else {
             unreachable!()
+        };
+
+        // If we wrote to a temp path, atomically rename to the final path.
+        // This ensures that even if the underlying storage (e.g., HDFS/QBFS)
+        // returns from close() before fully flushing data to durable storage,
+        // readers won't see a truncated file: they either see nothing at the
+        // final path (before rename) or the complete file (after rename).
+        if let Some(final_path) = &self.final_path {
+            self.store
+                .rename(&self.path, final_path)
+                .await
+                .map_err(|e| {
+                    Error::io(format!(
+                        "failed to rename temp file {} to final path {} after shutdown: {}",
+                        self.path, final_path, e
+                    ))
+                })?;
         }
+
+        Ok(result)
     }
 }
 

@@ -1334,17 +1334,48 @@ impl CommitHandler for UnsafeCommitHandler {
         }
 
         let version_path = naming_scheme.manifest_path(base_path, manifest.version);
-        let res =
-            manifest_writer(object_store, manifest, indices, &version_path, transaction).await?;
+
+        // For storage backends like HDFS/QBFS where close() can return before
+        // data is fully flushed, write to a temp path first then atomically
+        // rename. This guarantees readers won't see a truncated manifest.
+        let commit_result = if object_store.needs_safe_write() {
+            let tmp_path = make_staging_manifest_path(&version_path)?;
+            let res =
+                manifest_writer(object_store, manifest, indices, &tmp_path, transaction).await?;
+            object_store
+                .inner
+                .rename(&tmp_path, &version_path)
+                .await
+                .map_err(|e| {
+                    CommitError::OtherError(
+                        Error::io(format!(
+                            "failed to rename temp manifest {} to {}: {}",
+                            tmp_path, version_path, e
+                        ))
+                        .into(),
+                    )
+                })?;
+            (res, version_path)
+        } else {
+            let res = manifest_writer(
+                object_store,
+                manifest,
+                indices,
+                &version_path,
+                transaction,
+            )
+            .await?;
+            (res, version_path)
+        };
 
         write_version_hint(object_store, base_path, manifest.version).await;
 
         Ok(ManifestLocation {
             version: manifest.version,
-            size: Some(res.size as u64),
+            size: Some(commit_result.0.size as u64),
             naming_scheme,
-            path: version_path,
-            e_tag: res.e_tag,
+            path: commit_result.1,
+            e_tag: commit_result.0.e_tag,
             identity: None,
         })
     }
