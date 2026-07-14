@@ -19,7 +19,7 @@ description = "JNI bindings for Lance Columnar format"
 crate-type = ["cdylib"]
 
 [features]
-default = ["lance-io-aws","lance-io-azure","lance-io-gcp","hdfs","hdfs-jni","qbfs"]
+default = ["lance-io-aws","lance-io-azure","lance-io-gcp","hdfs-jni","qbfs"]
 backtrace = ["lance/backtrace", "lance-core/backtrace"]
 
 # Forward object-store provider features to `lance-io`.
@@ -88,3 +88,7 @@ strip = true
 
 [lints.clippy]
 disallowed_macros = "deny"
+
+# Same native-rename patch as root workspace (QBFS safe-write).
+[patch.crates-io]
+object_store_opendal = { path = "../../thirdparty/object_store_opendal" }

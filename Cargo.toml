@@ -283,3 +283,9 @@ multiple-crate-versions = "allow"
 single_range_in_vec_init = "allow"
 large_futures = "deny"
 disallowed_macros = "deny"
+
+# Local patch: restore native rename (object_store_opendal 0.55 behavior) on 0.57.
+# Pure downgrade to 0.55 also requires object_store 0.12 + opendal 0.55 and is incompatible
+# with current lance APIs.
+[patch.crates-io]
+object_store_opendal = { path = "thirdparty/object_store_opendal" }

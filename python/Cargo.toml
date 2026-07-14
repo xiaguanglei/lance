@@ -116,3 +116,6 @@ incremental = false
 [lints.clippy]
 disallowed_macros = "deny"
 
+# Same native-rename patch used by the root workspace (see ../Cargo.toml).
+[patch.crates-io]
+object_store_opendal = { path = "../thirdparty/object_store_opendal" }
