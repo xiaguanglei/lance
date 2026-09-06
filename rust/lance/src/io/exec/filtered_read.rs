@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2705,6 +2706,10 @@ impl FilteredReadExec {
 /// into lock contention
 const ROW_STREAM_CONCURRENT_BATCHES: usize = 4;
 
+/// Large unordered address batches can favor roaring over comparison sort.
+/// Ordered batches remain linear regardless of size.
+const ROW_ADDRESS_SORT_THRESHOLD: usize = 32_768;
+
 /// Fragment metadata, loaded on the first batch and reused afterwards
 struct StreamFragments {
     /// All dataset (or scoped) fragments, in dataset order
@@ -2791,18 +2796,14 @@ impl RowStreamRead {
 
     /// Build a batch's read ranges directly from physical row addresses
     fn plan_batch_from_addresses(
-        addrs: &RowAddrTreeMap,
+        requested_by_fragment: BTreeMap<u32, Vec<Range<u64>>>,
         fragments: &StreamFragments,
     ) -> FilteredReadInternalPlan {
         let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
-        for (fragment_id, requested) in addrs.iter() {
+        for (fragment_id, requested) in requested_by_fragment {
             // Unknown fragments (e.g. fully deleted) drop like stale keys
-            let Some(fragment) = fragments.get(*fragment_id) else {
+            let Some(fragment) = fragments.get(fragment_id) else {
                 continue;
-            };
-            let requested = match requested {
-                RowAddrSelection::Full => vec![0..fragment.num_physical_rows],
-                RowAddrSelection::Partial(bitmap) => bitmap_to_ranges(bitmap),
             };
             let valid = FilteredReadStream::full_frag_range(
                 fragment.num_physical_rows,
@@ -2810,7 +2811,7 @@ impl RowStreamRead {
             );
             let matched = FilteredReadStream::intersect_ranges(&valid, &requested);
             if !matched.is_empty() {
-                rows.insert(*fragment_id, matched);
+                rows.insert(fragment_id, matched);
             }
         }
         FilteredReadInternalPlan {
@@ -2818,6 +2819,46 @@ impl RowStreamRead {
             filters: HashMap::new(),
             scan_range_after_filter: None,
         }
+    }
+
+    fn row_address_ranges(
+        keys: &arrow_array::PrimitiveArray<UInt64Type>,
+    ) -> BTreeMap<u32, Vec<Range<u64>>> {
+        let mut addresses = if keys.null_count() == 0 {
+            Cow::Borrowed(keys.values().as_ref())
+        } else {
+            Cow::Owned(keys.iter().flatten().collect::<Vec<_>>())
+        };
+
+        let already_sorted = addresses.windows(2).all(|pair| pair[0] <= pair[1]);
+        if !already_sorted && addresses.len() > ROW_ADDRESS_SORT_THRESHOLD {
+            return RowAddrTreeMap::from_iter(addresses.iter().copied())
+                .iter()
+                .map(|(fragment_id, selection)| {
+                    let RowAddrSelection::Partial(bitmap) = selection else {
+                        unreachable!("individual row addresses cannot select a full fragment")
+                    };
+                    (*fragment_id, bitmap_to_ranges(bitmap))
+                })
+                .collect();
+        }
+        if !already_sorted {
+            addresses.to_mut().sort_unstable();
+        }
+
+        let mut rows: BTreeMap<u32, Vec<Range<u64>>> = BTreeMap::new();
+        for &address in addresses.iter() {
+            let fragment_id = (address >> 32) as u32;
+            let row_offset = address as u32 as u64;
+            let ranges = rows.entry(fragment_id).or_default();
+            match ranges.last_mut() {
+                Some(range) if row_offset <= range.end => {
+                    range.end = range.end.max(row_offset + 1);
+                }
+                _ => ranges.push(row_offset..row_offset + 1),
+            }
+        }
+        rows
     }
 
     /// Build a batch's read ranges by resolving stable row ids through the
@@ -2892,6 +2933,20 @@ impl RowStreamRead {
         keys: &arrow_array::PrimitiveArray<UInt64Type>,
     ) -> DataFusionResult<FilteredReadInternalPlan> {
         let compute_timer = self.baseline_metrics.elapsed_compute().timer();
+        // Row ids equal row addresses when the dataset does not use stable
+        // row ids, so either key resolves directly by position. Sort those
+        // addresses once and form ranges directly instead of round-tripping
+        // every row through a roaring bitmap.
+        if self.source.key_column == ROW_ADDR || !self.dataset.manifest.uses_stable_row_ids() {
+            let requested_by_fragment = Self::row_address_ranges(keys);
+            drop(compute_timer);
+            let fragments = self.load_fragments().await?;
+            return Ok(Self::plan_batch_from_addresses(
+                requested_by_fragment,
+                fragments,
+            ));
+        }
+
         // Null keys are excluded; attach_columns drops their rows
         let batch_keys = if keys.null_count() == 0 {
             RowAddrTreeMap::from_iter(keys.values().iter().copied())
@@ -2901,13 +2956,7 @@ impl RowStreamRead {
         drop(compute_timer);
 
         let fragments = self.load_fragments().await?;
-        // Row ids equal row addresses when the dataset does not use stable
-        // row ids, so either key resolves directly by position
-        if self.source.key_column == ROW_ADDR || !self.dataset.manifest.uses_stable_row_ids() {
-            Ok(Self::plan_batch_from_addresses(&batch_keys, fragments))
-        } else {
-            Ok(Self::plan_batch_from_row_ids(batch_keys, keys, fragments))
-        }
+        Ok(Self::plan_batch_from_row_ids(batch_keys, keys, fragments))
     }
 
     /// Read the batch's planned ranges through the same executor as a scan,
@@ -5855,6 +5904,48 @@ mod tests {
             let stream = futures::stream::iter(batches.into_iter().map(Ok));
             let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
             Arc::new(OneShotExec::new(stream))
+        }
+
+        #[test]
+        fn row_address_ranges_sort_deduplicate_and_merge() {
+            let address = |fragment_id: u64, row_offset: u64| (fragment_id << 32) | row_offset;
+            let keys = UInt64Array::from(vec![
+                Some(address(2, 9)),
+                Some(address(1, 4)),
+                Some(address(2, 7)),
+                Some(address(2, 7)),
+                None,
+                Some(address(1, 5)),
+                Some(address(1, 7)),
+                Some(address(2, 8)),
+                Some(address(3, u32::MAX as u64)),
+            ]);
+
+            assert_eq!(
+                RowStreamRead::row_address_ranges(&keys),
+                BTreeMap::from([
+                    (1, vec![4..6, 7..8]),
+                    (2, vec![7..10]),
+                    (3, vec![u32::MAX as u64..u32::MAX as u64 + 1]),
+                ])
+            );
+            assert!(
+                RowStreamRead::row_address_ranges(&UInt64Array::from(vec![None, None])).is_empty()
+            );
+
+            let dense_unordered =
+                UInt64Array::from_iter_values((0..ROW_ADDRESS_SORT_THRESHOLD as u64 + 1).rev());
+            assert_eq!(
+                RowStreamRead::row_address_ranges(&dense_unordered),
+                BTreeMap::from([(0, vec![0..ROW_ADDRESS_SORT_THRESHOLD as u64 + 1])])
+            );
+
+            let dense_ordered =
+                UInt64Array::from_iter_values(0..ROW_ADDRESS_SORT_THRESHOLD as u64 + 1);
+            assert_eq!(
+                RowStreamRead::row_address_ranges(&dense_ordered),
+                BTreeMap::from([(0, vec![0..ROW_ADDRESS_SORT_THRESHOLD as u64 + 1])])
+            );
         }
 
         fn take_plan(
