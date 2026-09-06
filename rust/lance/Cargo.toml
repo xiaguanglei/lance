@@ -57,7 +57,7 @@ crossbeam-queue = { workspace = true }
 crossbeam-skiplist.workspace = true
 # This is already used by datafusion
 dashmap.workspace = true
-# Fast non-cryptographic hasher for the hot FTS mem-index insert path.
+# Fast non-cryptographic hasher for hot internal lookup paths.
 rustc-hash = "2.1"
 # Compact FST term dictionary for the FTS mem-index partitions.
 fst.workspace = true

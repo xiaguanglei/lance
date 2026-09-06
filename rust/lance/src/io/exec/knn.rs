@@ -59,6 +59,7 @@ use lance_linalg::kernels::normalize_arrow;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -2885,9 +2886,17 @@ impl ExecutionPlan for MultivectorScoringExec {
         // collect the top k results from each stream,
         // and max-reduce for each query,
         // records the minimum distance for each query as estimation.
-        let mut reduced_inputs = stream::select_all(inputs.into_iter().map(|stream| {
-            stream.map(|batch| {
-                let batch = batch?;
+        let mut merged_inputs = stream::select_all(inputs);
+
+        let k = self.query.k;
+        let refactor = self.query.refine_factor.unwrap_or(1) as usize;
+        let num_queries = self.inputs.len() as f32;
+        let stream = stream::once(async move {
+            // at most, we will have k * refine_factor results for each query
+            let mut score_adjustments = FxHashMap::<u64, f32>::default();
+            score_adjustments.reserve(k * refactor);
+            let mut missed_sim_sum = 0.0;
+            while let Some(batch) = merged_inputs.try_next().await? {
                 let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
                 let dists = batch[DIST_COL].as_primitive::<Float32Type>();
                 debug_assert_eq!(dists.null_count(), 0);
@@ -2898,73 +2907,30 @@ impl ExecutionPlan for MultivectorScoringExec {
                     .last()
                     .map(|dist| 1.0 - *dist)
                     .unwrap_or_default();
-                let mut new_row_ids = Vec::with_capacity(row_ids.len());
-                let mut new_sims = Vec::with_capacity(row_ids.len());
-                let mut visited_row_ids = HashSet::with_capacity(row_ids.len());
+                let mut visited_row_ids = FxHashSet::default();
+                visited_row_ids.reserve(row_ids.len());
 
+                // Every candidate receives min_sim for this query. Store only the
+                // adjustment for rows that were actually returned, so absent rows
+                // do not require a full scan of the accumulated result set.
                 for (row_id, dist) in row_ids.values().iter().zip(dists.values().iter()) {
                     // the results are sorted by distance, so we can skip if we have seen this row id before
-                    if visited_row_ids.contains(row_id) {
+                    if !visited_row_ids.insert(*row_id) {
                         continue;
                     }
-                    visited_row_ids.insert(row_id);
-                    new_row_ids.push(*row_id);
                     // it's cosine distance, so we need to convert it to similarity
-                    new_sims.push(1.0 - *dist);
+                    let sim = 1.0 - *dist;
+                    *score_adjustments.entry(*row_id).or_default() += sim - min_sim;
                 }
-                let new_row_ids = UInt64Array::from(new_row_ids);
-                let new_dists = Float32Array::from(new_sims);
-
-                let batch = RecordBatch::try_new(
-                    KNN_INDEX_SCHEMA.clone(),
-                    vec![Arc::new(new_dists), Arc::new(new_row_ids)],
-                )?;
-
-                Ok::<_, DataFusionError>((min_sim, batch))
-            })
-        }));
-
-        let k = self.query.k;
-        let refactor = self.query.refine_factor.unwrap_or(1) as usize;
-        let num_queries = self.inputs.len() as f32;
-        let stream = stream::once(async move {
-            // at most, we will have k * refine_factor results for each query
-            let mut results = HashMap::with_capacity(k * refactor);
-            let mut missed_sim_sum = 0.0;
-            while let Some((min_sim, batch)) = reduced_inputs.try_next().await? {
-                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
-                let sims = batch[DIST_COL].as_primitive::<Float32Type>();
-
-                let query_results = row_ids
-                    .values()
-                    .iter()
-                    .copied()
-                    .zip(sims.values().iter().copied())
-                    .collect::<HashMap<_, _>>();
-
-                // for a row `r`:
-                // if `r` is in only `results``, then `results[r] += min_sim`
-                // if `r` is in only `query_results`, then `results[r] = query_results[r] + missed_similarities`,
-                // here `missed_similarities` is the sum of `min_sim` from previous iterations
-                // if `r` is in both, then `results[r] += query_results[r]`
-                results.iter_mut().for_each(|(row_id, sim)| {
-                    if let Some(new_dist) = query_results.get(row_id) {
-                        *sim += new_dist;
-                    } else {
-                        *sim += min_sim;
-                    }
-                });
-                query_results.into_iter().for_each(|(row_id, sim)| {
-                    results.entry(row_id).or_insert(sim + missed_sim_sum);
-                });
                 missed_sim_sum += min_sim;
             }
 
-            let (row_ids, sims): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-            let dists = sims
+            let (row_ids, score_adjustments): (Vec<_>, Vec<_>) =
+                score_adjustments.into_iter().unzip();
+            let dists = score_adjustments
                 .into_iter()
                 // it's similarity, so we need to convert it back to distance
-                .map(|sim| num_queries - sim)
+                .map(|score_adjustment| num_queries - (missed_sim_sum + score_adjustment))
                 .collect::<Vec<_>>();
             let row_ids = UInt64Array::from(row_ids);
             let dists = Float32Array::from(dists);
@@ -4616,7 +4582,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multivector_score() {
+    async fn test_multivector_score_fusion() {
         let query = Query {
             column: "vector".to_string(),
             key: Arc::new(generate_random_array(1)),
@@ -4656,21 +4622,26 @@ mod tests {
             Ok(results)
         }
 
-        let batches = (0..3)
-            .map(|i| {
-                RecordBatch::try_new(
-                    KNN_INDEX_SCHEMA.clone(),
-                    vec![
-                        Arc::new(Float32Array::from(vec![i as f32 + 1.0, i as f32 + 2.0])),
-                        Arc::new(UInt64Array::from(vec![i + 1, i + 2])),
-                    ],
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
+        let batches = [
+            (vec![0.05, 0.31, 0.60, 0.80], vec![1, 2, 2, 5]),
+            (vec![0.10, 0.40, 0.90], vec![2, 3, 5]),
+            (vec![0.20, 0.35, 0.70], vec![1, 3, 4]),
+            (vec![], vec![]),
+        ]
+        .into_iter()
+        .map(|(distances, row_ids)| {
+            RecordBatch::try_new(
+                KNN_INDEX_SCHEMA.clone(),
+                vec![
+                    Arc::new(Float32Array::from(distances)),
+                    Arc::new(UInt64Array::from(row_ids)),
+                ],
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
 
-        let mut res: Option<HashMap<_, _>> = None;
-        for perm in batches.into_iter().permutations(3) {
+        for perm in batches.into_iter().permutations(4) {
             let inputs = perm
                 .into_iter()
                 .map(|batch| {
@@ -4679,13 +4650,14 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             let new_res = multivector_scoring(inputs, query.clone()).await.unwrap();
-            assert_eq!(new_res.len(), 4);
-            if let Some(res) = &res {
-                for (row_id, dist) in new_res.iter() {
-                    assert_eq!(res.get(row_id).unwrap(), dist)
-                }
-            } else {
-                res = Some(new_res);
+            let expected = [(1, 2.15), (2, 2.11), (3, 2.55), (4, 3.40), (5, 3.40)];
+            assert_eq!(new_res.len(), expected.len());
+            for (row_id, expected_distance) in expected {
+                let actual_distance = new_res[&row_id];
+                assert!(
+                    (actual_distance - expected_distance).abs() < 1e-6,
+                    "row {row_id}: expected {expected_distance}, got {actual_distance}"
+                );
             }
         }
     }
