@@ -535,68 +535,71 @@ pub fn multivec_distance(
         )));
     }
 
-    let mut dists = Vec::with_capacity(vectors.len());
-    for v in vectors.iter() {
-        match v {
-            None => dists.push(f32::NAN),
-            Some(v) => {
-                let multivector = v.as_fixed_size_list();
-                if multivector.len() == 0 {
-                    dists.push(f32::NAN);
-                    continue;
-                }
-
-                let distance = match distance_type {
-                    DistanceType::Hamming => multivec_distance_impl::<UInt8Type>(
-                        query,
-                        multivector,
-                        dim,
-                        hamming::hamming,
-                    ),
-                    _ => match query.data_type() {
-                        DataType::Float16 => multivec_distance_impl::<Float16Type>(
-                            query,
-                            multivector,
-                            dim,
-                            distance_type.func(),
-                        ),
-                        DataType::Float32 => multivec_distance_impl::<Float32Type>(
-                            query,
-                            multivector,
-                            dim,
-                            distance_type.func(),
-                        ),
-                        DataType::Float64 => multivec_distance_impl::<Float64Type>(
-                            query,
-                            multivector,
-                            dim,
-                            distance_type.func(),
-                        ),
-                        _ => unreachable!("missed to check query type"),
-                    },
-                };
-
-                dists.push(distance);
-            }
+    Ok(match distance_type {
+        DistanceType::Hamming => {
+            multivec_distance_impl::<UInt8Type>(query, vectors, dim, hamming::hamming)
         }
-    }
-    Ok(dists)
+        _ => match query.data_type() {
+            DataType::Float16 => {
+                multivec_distance_impl::<Float16Type>(query, vectors, dim, distance_type.func())
+            }
+            DataType::Float32 => {
+                multivec_distance_impl::<Float32Type>(query, vectors, dim, distance_type.func())
+            }
+            DataType::Float64 => {
+                multivec_distance_impl::<Float64Type>(query, vectors, dim, distance_type.func())
+            }
+            _ => unreachable!("missed to check query type"),
+        },
+    })
 }
 
 fn multivec_distance_impl<T: ArrowPrimitiveType>(
     query: &dyn Array,
-    multivector: &FixedSizeListArray,
+    vectors: &ListArray,
     dim: usize,
     distance_func: DistanceFunc<T::Native>,
-) -> f32 {
+) -> Vec<f32> {
     let query = query.as_primitive::<T>().values();
+    // Read the shared child buffer directly. Iterating the outer ListArray
+    // would allocate and downcast a sliced ArrayRef for every row.
+    let all_values = vectors
+        .values()
+        .as_fixed_size_list()
+        .values()
+        .as_primitive::<T>()
+        .values();
+    let offsets = vectors.value_offsets();
+    let nulls = vectors.nulls();
+
+    (0..vectors.len())
+        .map(|row_index| {
+            let start = offsets[row_index] as usize;
+            let end = offsets[row_index + 1] as usize;
+            if start == end || nulls.is_some_and(|nulls| nulls.is_null(row_index)) {
+                return f32::NAN;
+            }
+
+            multivec_distance_values(
+                query,
+                &all_values[start * dim..end * dim],
+                dim,
+                distance_func,
+            )
+        })
+        .collect()
+}
+
+fn multivec_distance_values<T>(
+    query: &[T],
+    multivector: &[T],
+    dim: usize,
+    distance_func: DistanceFunc<T>,
+) -> f32 {
     query
         .chunks_exact(dim)
         .map(|q| {
             multivector
-                .values()
-                .as_primitive::<T>()
-                .values()
                 .chunks_exact(dim)
                 .map(|v| distance_func(q, v))
                 .min_by(|a, b| a.total_cmp(b))
@@ -617,7 +620,7 @@ mod tests {
     use arrow_array::{
         Float32Array, Float64Array, Int8Array, Int32Array, ListArray, PrimitiveArray, UInt8Array,
     };
-    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::Field;
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
@@ -1057,6 +1060,27 @@ mod tests {
         assert_eq!(dists, vec![0.0, 4.0]);
     }
 
+    #[test]
+    fn test_multivec_distance_float16_and_float64() {
+        let f16_vectors =
+            multivec_of::<Float16Type>(vec![f16::from_f32(1.0), f16::from_f32(2.0)], 2);
+        let f16_query = PrimitiveArray::<Float16Type>::from_iter_values([
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+        ]);
+        let f64_vectors = multivec_of::<Float64Type>(vec![1.0, 2.0], 2);
+        let f64_query = Float64Array::from_iter_values([1.0, 2.0]);
+
+        assert_eq!(
+            multivec_distance(&f16_query, &f16_vectors, DistanceType::L2).unwrap(),
+            vec![0.0]
+        );
+        assert_eq!(
+            multivec_distance(&f64_query, &f64_vectors, DistanceType::L2).unwrap(),
+            vec![0.0]
+        );
+    }
+
     #[rstest::rstest]
     #[case::l2_perfect(
         DistanceType::L2,
@@ -1121,5 +1145,48 @@ mod tests {
         assert_eq!(dists.len(), 2);
         assert!(dists[0].is_nan());
         assert_eq!(dists[1], -4.0);
+    }
+
+    #[test]
+    fn test_multivec_distance_sliced_rows() {
+        let query: Arc<dyn Array> =
+            Arc::new(Float32Array::from_iter_values([1.0_f32, 0.0, 0.0, 1.0]));
+        let vectors = multivecs_of::<Float32Type>(
+            vec![
+                vec![9.0, 9.0],
+                vec![1.0, 0.0, 0.0, 2.0],
+                vec![-1.0, 0.0, 0.0, 1.0],
+                vec![8.0, 8.0],
+            ],
+            2,
+        )
+        .slice(1, 2);
+
+        let dists = multivec_distance(query.as_ref(), &vectors, DistanceType::L2).unwrap();
+
+        assert_eq!(dists, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_multivec_distance_null_row_with_values_is_nan() {
+        let query: Arc<dyn Array> = Arc::new(Float32Array::from_iter_values([1.0_f32, 2.0]));
+        let vectors = multivecs_of::<Float32Type>(
+            vec![vec![1.0, 2.0], vec![100.0, 100.0], vec![3.0, 4.0]],
+            2,
+        );
+        let (field, offsets, values, _) = vectors.into_parts();
+        let vectors = ListArray::try_new(
+            field,
+            offsets,
+            values,
+            Some(NullBuffer::from(vec![true, false, true])),
+        )
+        .unwrap();
+
+        let dists = multivec_distance(query.as_ref(), &vectors, DistanceType::Dot).unwrap();
+
+        assert_eq!(dists[0], -4.0);
+        assert!(dists[1].is_nan());
+        assert_eq!(dists[2], -10.0);
     }
 }
