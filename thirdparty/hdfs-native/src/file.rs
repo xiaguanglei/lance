@@ -8,13 +8,16 @@ use bytes::{BufMut, Bytes, BytesMut};
 use futures::stream::BoxStream;
 use futures::{Stream, StreamExt, stream};
 use log::warn;
+use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 use tokio::runtime::Handle;
 
+use crate::block_locations::LocatedBlocksState;
 use crate::common::config::Configuration;
 use crate::ec::{EcSchema, resolve_ec_policy};
 use crate::hdfs::block_reader::get_block_stream;
 use crate::hdfs::block_writer::BlockWriter;
+use crate::hdfs::connection::DatanodeConnectionCache;
 use crate::hdfs::crypto::FileCryptoCodec;
 use crate::hdfs::protocol::{LeaseTracker, NamenodeProtocol};
 use crate::proto::hdfs;
@@ -22,7 +25,6 @@ use crate::{HdfsError, Result};
 
 const COMPLETE_RETRY_DELAY_MS: u64 = 500;
 const COMPLETE_RETRIES: u32 = 5;
-
 fn io_error(error: HdfsError) -> io::Error {
     io::Error::other(error)
 }
@@ -34,31 +36,38 @@ struct PendingRead {
 
 pub struct FileReader {
     protocol: Arc<NamenodeProtocol>,
-    located_blocks: hdfs::LocatedBlocksProto,
+    path: String,
+    located_blocks: Arc<LocatedBlocksState>,
     ec_schema: Option<EcSchema>,
     position: usize,
     config: Arc<Configuration>,
     handle: Handle,
+    datanode_connection_cache: Arc<DatanodeConnectionCache>,
     pending_read: Option<std::sync::Mutex<PendingRead>>,
     crypto: Option<Arc<FileCryptoCodec>>,
 }
 
 impl FileReader {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         protocol: Arc<NamenodeProtocol>,
-        located_blocks: hdfs::LocatedBlocksProto,
+        path: String,
+        located_blocks: Arc<LocatedBlocksState>,
         ec_schema: Option<EcSchema>,
         config: Arc<Configuration>,
         handle: Handle,
+        datanode_connection_cache: Arc<DatanodeConnectionCache>,
         crypto: Option<Arc<FileCryptoCodec>>,
     ) -> Self {
         Self {
             protocol,
+            path,
             located_blocks,
             ec_schema,
             position: 0,
             config,
             handle,
+            datanode_connection_cache,
             pending_read: None,
             crypto,
         }
@@ -66,7 +75,7 @@ impl FileReader {
 
     /// Returns the total size of the file
     pub fn file_length(&self) -> usize {
-        self.located_blocks.file_length as usize
+        self.located_blocks.current().file_length as usize
     }
 
     /// Returns the remaining bytes left based on the current cursor position.
@@ -125,7 +134,8 @@ impl FileReader {
     ///
     /// Panics if the requested range is outside of the file
     pub async fn read_range(&self, offset: usize, len: usize) -> Result<Bytes> {
-        let mut stream = self.read_range_stream(offset, len);
+        let stream = self.read_range_stream(offset, len);
+        futures::pin_mut!(stream);
         let mut buf = BytesMut::with_capacity(len);
         while let Some(bytes) = stream.next().await.transpose()? {
             buf.put(bytes);
@@ -137,7 +147,8 @@ impl FileReader {
     ///
     /// Panics if the requested range is outside of the file
     pub async fn read_range_buf(&self, mut buf: &mut [u8], offset: usize) -> Result<()> {
-        let mut stream = self.read_range_stream(offset, buf.len());
+        let stream = self.read_range_stream(offset, buf.len());
+        futures::pin_mut!(stream);
         while let Some(bytes) = stream.next().await.transpose()? {
             buf.put(bytes);
         }
@@ -152,32 +163,175 @@ impl FileReader {
         &self,
         offset: usize,
         len: usize,
-    ) -> impl Stream<Item = Result<Bytes>> + use<> {
-        if offset + len > self.file_length() {
-            panic!("Cannot read past end of the file");
+    ) -> BoxStream<'static, Result<Bytes>> {
+        let located_blocks = self.located_blocks.current();
+        let file_length = located_blocks.file_length as usize;
+        assert!(
+            offset <= file_length && len <= file_length - offset,
+            "Cannot read past end of the file"
+        );
+        let max_block_acquire_failures = self.config.max_block_acquire_failures();
+        let retry_window_base_ms = self.config.retry_window_base_millis();
+        let state = RangeReadState {
+            stream: Self::range_stream(
+                &located_blocks,
+                offset,
+                len,
+                Arc::clone(&self.protocol),
+                self.ec_schema.clone(),
+                Arc::clone(&self.config),
+                self.handle.clone(),
+                Arc::clone(&self.datanode_connection_cache),
+                self.crypto.clone(),
+            ),
+            protocol: Arc::clone(&self.protocol),
+            path: self.path.clone(),
+            shared_located_blocks: Arc::clone(&self.located_blocks),
+            located_blocks,
+            config: Arc::clone(&self.config),
+            handle: self.handle.clone(),
+            datanode_connection_cache: Arc::clone(&self.datanode_connection_cache),
+            crypto: self.crypto.clone(),
+            next_offset: offset,
+            remaining: len,
+            refreshes: 0,
+            max_block_acquire_failures,
+            retry_window_base_ms,
+        };
+
+        Box::pin(stream::unfold(state, |mut state| async move {
+            loop {
+                if state.remaining == 0 {
+                    return None;
+                }
+
+                match state.stream.next().await {
+                    Some(Ok(bytes)) => {
+                        if bytes.len() > state.remaining {
+                            state.remaining = 0;
+                            return Some((
+                                Err(HdfsError::DataTransferError(
+                                    "DataNode returned more data than requested".to_string(),
+                                )),
+                                state,
+                            ));
+                        }
+                        state.next_offset += bytes.len();
+                        state.remaining -= bytes.len();
+                        return Some((Ok(bytes), state));
+                    }
+                    Some(Err(error)) => {
+                        if state.refreshes >= state.max_block_acquire_failures {
+                            state.remaining = 0;
+                            return Some((Err(error), state));
+                        }
+                    }
+                    None => {
+                        if state.refreshes >= state.max_block_acquire_failures {
+                            state.remaining = 0;
+                            return Some((
+                                Err(HdfsError::DataTransferError(
+                                    "Not enough data returned from DataNode".to_string(),
+                                )),
+                                state,
+                            ));
+                        }
+                    }
+                }
+
+                let failures = u64::try_from(state.refreshes).unwrap_or(u64::MAX);
+                state.refreshes += 1;
+                let retry_window = state
+                    .retry_window_base_ms
+                    .saturating_mul(failures.saturating_add(1));
+                let retry_delay = state
+                    .retry_window_base_ms
+                    .saturating_mul(failures)
+                    .saturating_add(if retry_window == 0 {
+                        0
+                    } else {
+                        rand::rng().random_range(0..retry_window)
+                    });
+                if retry_delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(retry_delay)).await;
+                }
+                let refreshed = match state
+                    .shared_located_blocks
+                    .refresh_if_current(&state.protocol, &state.path, &state.located_blocks)
+                    .await
+                {
+                    Ok(refreshed) => refreshed,
+                    Err(error) => {
+                        state.remaining = 0;
+                        return Some((Err(error), state));
+                    }
+                };
+                let ec_schema = match refreshed
+                    .ec_policy
+                    .as_ref()
+                    .map(resolve_ec_policy)
+                    .transpose()
+                {
+                    Ok(ec_schema) => ec_schema,
+                    Err(error) => {
+                        state.remaining = 0;
+                        return Some((Err(error), state));
+                    }
+                };
+                state.stream = Self::range_stream(
+                    &refreshed,
+                    state.next_offset,
+                    state.remaining,
+                    Arc::clone(&state.protocol),
+                    ec_schema,
+                    Arc::clone(&state.config),
+                    state.handle.clone(),
+                    Arc::clone(&state.datanode_connection_cache),
+                    state.crypto.clone(),
+                );
+                state.located_blocks = refreshed;
+            }
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn range_stream(
+        located_blocks: &hdfs::LocatedBlocksProto,
+        offset: usize,
+        len: usize,
+        protocol: Arc<NamenodeProtocol>,
+        ec_schema: Option<EcSchema>,
+        config: Arc<Configuration>,
+        handle: Handle,
+        datanode_connection_cache: Arc<DatanodeConnectionCache>,
+        crypto: Option<Arc<FileCryptoCodec>>,
+    ) -> BoxStream<'static, Result<Bytes>> {
+        if len == 0 {
+            return stream::empty().boxed();
         }
 
-        let block_streams: Vec<BoxStream<Result<Bytes>>> = self
-            .located_blocks
+        let range_end = offset + len;
+        let block_streams: Vec<BoxStream<Result<Bytes>>> = located_blocks
             .blocks
             .iter()
             .flat_map(move |block| {
                 let block_file_start = block.offset as usize;
                 let block_file_end = block_file_start + block.b.num_bytes() as usize;
 
-                if block_file_start < (offset + len) && block_file_end > offset {
+                if block_file_start < range_end && block_file_end > offset {
                     // We need to read this block
                     let block_start = offset - usize::min(offset, block_file_start);
-                    let block_end = usize::min(offset + len, block_file_end) - block_file_start;
+                    let block_end = usize::min(range_end, block_file_end) - block_file_start;
                     Some(get_block_stream(
-                        Arc::clone(&self.protocol),
+                        Arc::clone(&protocol),
                         block.clone(),
                         block_start,
                         block_end - block_start,
-                        self.ec_schema.clone(),
-                        Arc::clone(&self.config),
-                        self.handle.clone(),
-                        self.crypto.clone(),
+                        ec_schema.clone(),
+                        Arc::clone(&config),
+                        handle.clone(),
+                        Arc::clone(&datanode_connection_cache),
+                        crypto.clone(),
                     ))
                 } else {
                     // No data is needed from this block
@@ -186,8 +340,25 @@ impl FileReader {
             })
             .collect();
 
-        stream::iter(block_streams).flatten()
+        stream::iter(block_streams).flatten().boxed()
     }
+}
+
+struct RangeReadState {
+    stream: BoxStream<'static, Result<Bytes>>,
+    protocol: Arc<NamenodeProtocol>,
+    path: String,
+    shared_located_blocks: Arc<LocatedBlocksState>,
+    located_blocks: Arc<hdfs::LocatedBlocksProto>,
+    config: Arc<Configuration>,
+    handle: Handle,
+    datanode_connection_cache: Arc<DatanodeConnectionCache>,
+    crypto: Option<Arc<FileCryptoCodec>>,
+    next_offset: usize,
+    remaining: usize,
+    refreshes: usize,
+    max_block_acquire_failures: usize,
+    retry_window_base_ms: u64,
 }
 
 impl AsyncRead for FileReader {

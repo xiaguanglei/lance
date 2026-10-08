@@ -96,6 +96,10 @@ name = "test_read_resiliency"
 path = "tests/test_read_resiliency.rs"
 
 [[test]]
+name = "test_datanode_pool_benchmark"
+path = "tests/test_datanode_pool_benchmark.rs"
+
+[[test]]
 name = "test_trash"
 path = "tests/test_trash.rs"
 
@@ -151,7 +155,10 @@ version = "0.4"
 version = "0.5"
 
 [dependencies.crc]
-version = "3.4"
+version = "3.3"
+
+[dependencies.crc32c]
+version = "0.6.8"
 
 [dependencies.ctr]
 version = "0.10"

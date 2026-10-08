@@ -129,6 +129,16 @@ The client will attempt to read Hadoop configs `core-site.xml` and `hdfs-site.xm
   - `org.apache.hadoop.hdfs.server.namenode.ha.ObserverReadProxyProvider`
   - `org.apache.hadoop.hdfs.server.namenode.ha.RouterObserverReadConfiguredFailoverProxyProvider`
 - `dfs.client.use.datanode.hostname` - Use DataNode hostnames instead of IP addresses for DataNode connections
+- `dfs.client.socket-timeout` - Maximum duration of each DataNode packet read or final read acknowledgement, in milliseconds. Defaults to Hadoop's value of `60000`; set to `0` to disable the timeout.
+- `dfs.client.max.block.acquire.failures` - Maximum number of times a read operation refreshes block locations after exhausting the available DataNodes. Defaults to `3`.
+- `dfs.client.retry.window.base` - Base retry window, in milliseconds, used to back off before refreshing block locations. Defaults to `3000`.
+- `dfs.client.socketcache.capacity` - Maximum number of idle DataNode connections retained by each client. Defaults to Hadoop's value of `16`; set to `0` to disable reuse.
+- `dfs.client.socketcache.expiryMsec` - Maximum idle age of a cached DataNode connection in milliseconds. Defaults to Hadoop's value of `3000`.
+- `dfs.client.socketcache.maxTotal` - Maximum number of live DataNode read connections per client, including checked-out and idle connections. Defaults to `0` (unlimited). Excess reads wait asynchronously and reuse returned peers; the value must be at least `dfs.client.socketcache.capacity`.
+- `dfs.client.cached.conn.retry` - Maximum number of cached DataNode connections tried before opening a new connection. Defaults to Hadoop's value of `3`.
+- `dfs.client.read.replica-round-robin` - Spread first-choice reads across healthy `NORMAL` replicas without requiring rack locality. Replicas with missing/lagging heartbeat metadata or a maintenance/decommission state remain ordered fallbacks. Rotation is skipped when the NameNode is configured to prioritize slow nodes, read load, or storage type because those priorities are not fully represented in the client protocol. Defaults to `false`.
+- `dfs.client.read.block-locations-cache.capacity` - Maximum number of complete-file block maps cached per client. Defaults to `0` (disabled). The cache stores metadata only, coalesces concurrent opens of the same path, and invalidates entries after mutations made through the same client.
+- `dfs.client.read.block-locations-cache.ttl-ms` - Block-location cache TTL in milliseconds. Defaults to `60000` when the cache is enabled. Mutations made by another HDFS client can remain invisible until this TTL expires, so enable the cache only for immutable/versioned data or choose a TTL that matches the application's consistency requirements.
 - `dfs.client.block.write.replace-datanode-on-failure.enable`
 - `dfs.client.block.write.replace-datanode-on-failure.policy`
 - `dfs.client.block.write.replace-datanode-on-failure.best-effort`
@@ -137,6 +147,10 @@ The client will attempt to read Hadoop configs `core-site.xml` and `hdfs-site.xm
 - `fs.viewfs.mounttable.*.homedir` - ViewFS home directory prefix
 - `fs.viewfs.mounttable.*.link.*` - ViewFS links
 - `fs.viewfs.mounttable.*.linkFallback` - ViewFS link fallback
+
+Repeated positioned reads on one `FileReader` reuse its block locations without
+another NameNode call. A DataNode failure refreshes that reader's block map;
+normal `Client::read` calls always fetch fresh block locations.
 
 All other settings are generally assumed to be the defaults currently. For instance, security is assumed to be enabled and SASL negotiation is always done, but on insecure clusters this will just do SIMPLE authentication. Any setups that require other customized Hadoop client configs may not work correctly.
 

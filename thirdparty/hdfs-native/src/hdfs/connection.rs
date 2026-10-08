@@ -1,19 +1,19 @@
 use std::collections::{HashMap, VecDeque};
 use std::default::Default;
+use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::ErrorKind;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use chrono::{TimeDelta, prelude::*};
+use bytes::{BufMut, Bytes, BytesMut};
 use crc::{CRC_32_ISCSI, CRC_32_ISO_HDLC, Crc, Table};
 use log::{debug, warn};
-use once_cell::sync::Lazy;
 use prost::Message;
 use socket2::SockRef;
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::{io::AsyncWriteExt, net::TcpStream, task::JoinHandle};
 use uuid::Uuid;
 
@@ -32,13 +32,33 @@ use crate::{HdfsError, Result};
 const PROTOCOL: &str = "org.apache.hadoop.hdfs.protocol.ClientProtocol";
 const DATA_TRANSFER_VERSION: u16 = 28;
 const MAX_PACKET_HEADER_SIZE: usize = 33;
-const DATANODE_CACHE_EXPIRY: TimeDelta = TimeDelta::seconds(3);
+const DATANODE_CACHE_SHARDS: usize = 16;
 
 const CRC32: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&CRC_32_ISO_HDLC);
 const CRC32C: Crc<u32, Table<16>> = Crc::<u32, Table<16>>::new(&CRC_32_ISCSI);
 
-pub(crate) static DATANODE_CACHE: Lazy<DatanodeConnectionCache> =
-    Lazy::new(DatanodeConnectionCache::new);
+#[inline]
+fn checksum_crc32c(data: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("sse4.2") {
+        return crc32c::crc32c(data);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        return crc32c::crc32c(data);
+    }
+
+    // Preserve the existing slicing-by-16 implementation on CPUs without a
+    // hardware CRC32C instruction.
+    CRC32C.checksum(data)
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn datanode_url(datanode_id: &DatanodeIdProto, config: &Configuration) -> String {
     let host = if config.use_datanode_hostname() {
@@ -467,6 +487,65 @@ impl Op {
 }
 
 const CHECKSUM_BYTES: usize = 4;
+const PACKET_DATA_LENGTH_BYTES: usize = 4;
+
+fn packet_body_length(payload_length: usize) -> Result<usize> {
+    payload_length
+        .checked_sub(PACKET_DATA_LENGTH_BYTES)
+        .ok_or_else(|| {
+            HdfsError::DataTransferError(format!("invalid packet payload length: {payload_length}"))
+        })
+}
+
+fn packet_checksum_length(body_length: usize, data_length: i32) -> Result<usize> {
+    let data_length = usize::try_from(data_length).map_err(|_| {
+        HdfsError::DataTransferError(format!("invalid packet data length: {data_length}"))
+    })?;
+    body_length.checked_sub(data_length).ok_or_else(|| {
+        HdfsError::DataTransferError(format!(
+            "packet data length {data_length} exceeds body length {body_length}"
+        ))
+    })
+}
+
+#[inline]
+fn verify_checksums<F>(
+    data: &[u8],
+    checksums: &[u8],
+    bytes_per_checksum: usize,
+    calculate: F,
+) -> Result<()>
+where
+    F: Fn(&[u8]) -> u32,
+{
+    if bytes_per_checksum == 0 {
+        return Err(HdfsError::ChecksumError);
+    }
+
+    let checksum_count = data.len().div_ceil(bytes_per_checksum);
+    let required_checksum_bytes = checksum_count
+        .checked_mul(CHECKSUM_BYTES)
+        .ok_or(HdfsError::ChecksumError)?;
+    if checksums.len() < required_checksum_bytes {
+        return Err(HdfsError::ChecksumError);
+    }
+
+    for (data_chunk, checksum_chunk) in data
+        .chunks(bytes_per_checksum)
+        .zip(checksums.chunks_exact(CHECKSUM_BYTES))
+    {
+        let expected = u32::from_be_bytes([
+            checksum_chunk[0],
+            checksum_chunk[1],
+            checksum_chunk[2],
+            checksum_chunk[3],
+        ]);
+        if calculate(data_chunk) != expected {
+            return Err(HdfsError::ChecksumError);
+        }
+    }
+    Ok(())
+}
 
 pub(crate) struct ReadPacket {
     pub header: hdfs::PacketHeaderProto,
@@ -484,30 +563,49 @@ impl ReadPacket {
     }
 
     pub(crate) fn get_data(
-        mut self,
+        self,
         checksum_info: &Option<hdfs::ReadOpChecksumInfoProto>,
     ) -> Result<Bytes> {
+        #[cfg(feature = "integration-test")]
+        let checksum_started_at = std::time::Instant::now();
+        #[cfg(feature = "integration-test")]
+        let mut checksum_verified = false;
         // Verify the checksums if they were requested
         if let Some(info) = checksum_info {
-            let algorithm = match info.checksum.r#type() {
-                hdfs::ChecksumTypeProto::ChecksumCrc32 => Some(&CRC32),
-                hdfs::ChecksumTypeProto::ChecksumCrc32c => Some(&CRC32C),
-                hdfs::ChecksumTypeProto::ChecksumNull => None,
-            };
-
-            if let Some(algorithm) = algorithm {
-                // Create a new Bytes view over the data that we can consume
-                let mut checksum_data = self.data.clone();
-                while !checksum_data.is_empty() {
-                    let chunk_checksum = algorithm.checksum(&checksum_data.split_to(usize::min(
-                        info.checksum.bytes_per_checksum as usize,
-                        checksum_data.len(),
-                    )));
-                    if chunk_checksum != self.checksum.get_u32() {
-                        return Err(HdfsError::ChecksumError);
+            let bytes_per_checksum = info.checksum.bytes_per_checksum as usize;
+            match info.checksum.r#type() {
+                hdfs::ChecksumTypeProto::ChecksumCrc32 => {
+                    verify_checksums(&self.data, &self.checksum, bytes_per_checksum, |data| {
+                        CRC32.checksum(data)
+                    })?;
+                    #[cfg(feature = "integration-test")]
+                    {
+                        checksum_verified = true;
                     }
                 }
+                hdfs::ChecksumTypeProto::ChecksumCrc32c => {
+                    verify_checksums(
+                        &self.data,
+                        &self.checksum,
+                        bytes_per_checksum,
+                        checksum_crc32c,
+                    )?;
+                    #[cfg(feature = "integration-test")]
+                    {
+                        checksum_verified = true;
+                    }
+                }
+                hdfs::ChecksumTypeProto::ChecksumNull => {}
             }
+        }
+        #[cfg(feature = "integration-test")]
+        if checksum_verified {
+            crate::test::CHECKSUM_BYTES_VERIFIED
+                .fetch_add(self.data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::test::CHECKSUM_VERIFY_NANOS.fetch_add(
+                checksum_started_at.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         Ok(self.data)
     }
@@ -579,14 +677,11 @@ impl WritePacket {
             return Bytes::new();
         }
 
-        let mut checksum = BytesMut::with_capacity(self.data.len() / self.bytes_per_checksum);
+        let checksum_count = self.data.len().div_ceil(self.bytes_per_checksum);
+        let mut checksum = BytesMut::with_capacity(checksum_count * CHECKSUM_BYTES);
 
-        let mut chunk_start = 0;
-        while chunk_start < self.data.len() {
-            let chunk_end = usize::min(chunk_start + self.bytes_per_checksum, self.data.len());
-            let chunk_checksum = CRC32C.checksum(&self.data[chunk_start..chunk_end]);
-            checksum.put_u32(chunk_checksum);
-            chunk_start += self.bytes_per_checksum;
+        for chunk in self.data.chunks(self.bytes_per_checksum) {
+            checksum.put_u32(checksum_crc32c(chunk));
         }
 
         checksum.freeze()
@@ -598,6 +693,10 @@ pub(crate) struct DatanodeConnection {
     reader: SaslDatanodeReader,
     writer: SaslDatanodeWriter,
     url: String,
+    // Present only for read connections when a client-level total connection
+    // budget is configured. The permit follows the live TCP connection both
+    // while checked out and while retained in the idle cache.
+    _total_capacity_permit: Option<TotalConnectionPermit>,
 }
 
 impl DatanodeConnection {
@@ -608,6 +707,8 @@ impl DatanodeConnection {
         config: &Configuration,
         handle: &Handle,
     ) -> Result<Self> {
+        #[cfg(feature = "integration-test")]
+        let started_at = std::time::Instant::now();
         let url = datanode_url(datanode_id, config);
         let stream = connect(&url, handle).await?;
 
@@ -621,8 +722,22 @@ impl DatanodeConnection {
             reader,
             writer,
             url: url.to_string(),
+            _total_capacity_permit: None,
         };
+        #[cfg(feature = "integration-test")]
+        {
+            crate::test::DATANODE_NEW_CONNECTIONS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::test::DATANODE_NEW_CONNECTION_NANOS.fetch_add(
+                started_at.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         Ok(conn)
+    }
+
+    pub(crate) fn set_total_capacity_permit(&mut self, permit: Option<TotalConnectionPermit>) {
+        self._total_capacity_permit = permit;
     }
 
     pub(crate) async fn send(
@@ -670,14 +785,20 @@ impl DatanodeConnection {
 
         let payload_length = u32::from_be_bytes(payload_len_buf) as usize;
         let header_length = u16::from_be_bytes(header_len_buf) as usize;
+        let body_length = packet_body_length(payload_length)?;
+        let remaining_length = body_length.checked_add(header_length).ok_or_else(|| {
+            HdfsError::DataTransferError(format!(
+                "packet length overflow: payload={payload_length}, header={header_length}"
+            ))
+        })?;
 
-        let mut remaining_buf = BytesMut::zeroed(payload_length - 4 + header_length);
+        let mut remaining_buf = BytesMut::zeroed(remaining_length);
         self.reader.read_exact(&mut remaining_buf).await?;
 
         let header =
             hdfs::PacketHeaderProto::decode(remaining_buf.split_to(header_length).freeze())?;
 
-        let checksum_length = payload_length - 4 - header.data_len as usize;
+        let checksum_length = packet_checksum_length(body_length, header.data_len)?;
         let checksum = remaining_buf.split_to(checksum_length).freeze();
         let data = remaining_buf.freeze();
 
@@ -749,17 +870,160 @@ impl DatanodeWriter {
     }
 }
 
-type DatanodeConnectionCacheEntry = VecDeque<(DateTime<Utc>, DatanodeConnection)>;
+struct CachedDatanodeConnection {
+    released_at: Instant,
+    connection: DatanodeConnection,
+    _capacity_permit: OwnedSemaphorePermit,
+}
 
+pub(crate) struct TotalConnectionPermit {
+    permit: Option<OwnedSemaphorePermit>,
+    connection_available: Arc<Notify>,
+}
+
+pub(crate) struct DatanodeConnectionAcquisition {
+    pub(crate) connection: Option<DatanodeConnection>,
+    pub(crate) total_capacity_permit: Option<TotalConnectionPermit>,
+}
+
+impl Drop for TotalConnectionPermit {
+    fn drop(&mut self) {
+        // Rust drops fields after `Drop::drop` returns. Release explicitly so
+        // a woken waiter cannot observe the semaphore at capacity and go back
+        // to sleep without another notification.
+        drop(self.permit.take());
+        self.connection_available.notify_one();
+    }
+}
+
+type DatanodeConnectionCacheEntry = VecDeque<CachedDatanodeConnection>;
+type DatanodeConnectionCacheShard = Mutex<HashMap<String, DatanodeConnectionCacheEntry>>;
+
+/// Client-scoped cache of idle DataNode connections.
+///
+/// This follows Hadoop's `PeerCache` lifecycle: idle peers are bounded by
+/// `dfs.client.socketcache.capacity`, expire after
+/// `dfs.client.socketcache.expiryMsec`, and stale cached peers are retried only
+/// `dfs.client.cached.conn.retry` times. Unlike the Java implementation, the
+/// cache is sharded by DataNode so unrelated reads do not contend on one lock.
 pub(crate) struct DatanodeConnectionCache {
-    cache: Mutex<HashMap<String, DatanodeConnectionCacheEntry>>,
+    shards: Vec<DatanodeConnectionCacheShard>,
+    capacity: usize,
+    capacity_permits: Arc<Semaphore>,
+    max_total: usize,
+    total_capacity_permits: Option<Arc<Semaphore>>,
+    connection_available: Arc<Notify>,
+    expiry: Duration,
+    cached_connection_retries: usize,
+    eviction_cursor: AtomicUsize,
+    cleanup_started: AtomicBool,
+    replica_round_robin: bool,
+    replica_cursor: AtomicUsize,
+    handle: Handle,
+}
+
+impl fmt::Debug for DatanodeConnectionCache {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DatanodeConnectionCache")
+            .field("capacity", &self.capacity)
+            .field("max_total", &self.max_total)
+            .field("expiry", &self.expiry)
+            .field("cached_connection_retries", &self.cached_connection_retries)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DatanodeConnectionCache {
-    fn new() -> Self {
-        Self {
-            cache: Mutex::new(HashMap::new()),
+    pub(crate) fn new(
+        capacity: usize,
+        max_total: usize,
+        expiry: Duration,
+        cached_connection_retries: usize,
+        replica_round_robin: bool,
+        handle: &Handle,
+    ) -> Arc<Self> {
+        let shard_count = DATANODE_CACHE_SHARDS.min(capacity.max(1));
+        Arc::new(Self {
+            shards: (0..shard_count)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+            capacity,
+            capacity_permits: Arc::new(Semaphore::new(capacity)),
+            max_total,
+            total_capacity_permits: (max_total > 0).then(|| Arc::new(Semaphore::new(max_total))),
+            connection_available: Arc::new(Notify::new()),
+            expiry,
+            cached_connection_retries,
+            eviction_cursor: AtomicUsize::new(0),
+            cleanup_started: AtomicBool::new(false),
+            replica_round_robin,
+            replica_cursor: AtomicUsize::new(0),
+            handle: handle.clone(),
+        })
+    }
+
+    pub(crate) fn cached_connection_retries(&self) -> usize {
+        self.cached_connection_retries
+    }
+
+    pub(crate) fn next_replica_offset(&self) -> Option<usize> {
+        self.replica_round_robin
+            .then(|| self.replica_cursor.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Acquire a reusable peer or reserve capacity for a new live DataNode read
+    /// connection. A zero total limit preserves hdfs-native's historical
+    /// unlimited behavior. Waiters always recheck the target DataNode first so
+    /// a freshly returned hot peer is reused instead of immediately evicted.
+    pub(crate) async fn acquire(
+        &self,
+        datanode_id: &hdfs::DatanodeIdProto,
+        config: &Configuration,
+        allow_cached: bool,
+    ) -> DatanodeConnectionAcquisition {
+        loop {
+            let notified = self.connection_available.notified();
+            tokio::pin!(notified);
+            // Register before checking either source of capacity. This closes
+            // the gap where a connection could be returned between the checks
+            // below and the first poll of `notified`.
+            let _ = notified.as_mut().enable();
+            if allow_cached && let Some(connection) = self.get(datanode_id, config) {
+                return DatanodeConnectionAcquisition {
+                    connection: Some(connection),
+                    total_capacity_permit: None,
+                };
+            }
+            let Some(permits) = self.total_capacity_permits.as_ref() else {
+                return DatanodeConnectionAcquisition {
+                    connection: None,
+                    total_capacity_permit: None,
+                };
+            };
+            if let Ok(permit) = Arc::clone(permits).try_acquire_owned() {
+                return DatanodeConnectionAcquisition {
+                    connection: None,
+                    total_capacity_permit: Some(TotalConnectionPermit {
+                        permit: Some(permit),
+                        connection_available: Arc::clone(&self.connection_available),
+                    }),
+                };
+            }
+            if self.evict_one() {
+                continue;
+            }
+            #[cfg(feature = "integration-test")]
+            crate::test::DATANODE_CONNECTION_POOL_WAITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            notified.await;
         }
+    }
+
+    fn shard(&self, url: &str) -> usize {
+        let mut hasher = DefaultHasher::new();
+        url.hash(&mut hasher);
+        hasher.finish() as usize % self.shards.len()
     }
 
     pub(crate) fn get(
@@ -767,35 +1031,153 @@ impl DatanodeConnectionCache {
         datanode_id: &hdfs::DatanodeIdProto,
         config: &Configuration,
     ) -> Option<DatanodeConnection> {
-        // Keep things simple and just expire cache entries when checking the cache. We could
-        // move this to its own task but that will add a little more complexity.
-        self.remove_expired();
+        if self.capacity == 0 {
+            #[cfg(feature = "integration-test")]
+            crate::test::DATANODE_CONNECTION_CACHE_MISSES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
 
         let url = datanode_url(datanode_id, config);
-        let mut cache = self.cache.lock().unwrap();
+        let shard_index = self.shard(&url);
+        let mut shard = lock_unpoisoned(&self.shards[shard_index]);
+        let mut remove_entry = false;
+        let result = if let Some(connections) = shard.get_mut(&url) {
+            let mut result = None;
+            while let Some(cached) = connections.pop_front() {
+                if cached.released_at.elapsed() < self.expiry {
+                    result = Some(cached.connection);
+                    break;
+                }
+                #[cfg(feature = "integration-test")]
+                crate::test::DATANODE_CONNECTION_CACHE_EXPIRED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            remove_entry = connections.is_empty();
+            result
+        } else {
+            None
+        };
+        if remove_entry {
+            shard.remove(&url);
+        }
+        drop(shard);
 
-        cache
-            .get_mut(&url)
-            .iter_mut()
-            .flat_map(|conns| conns.pop_front())
-            .map(|(_, conn)| conn)
-            .next()
+        #[cfg(feature = "integration-test")]
+        if result.is_some() {
+            crate::test::DATANODE_CONNECTION_CACHE_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            crate::test::DATANODE_CONNECTION_CACHE_MISSES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
-    pub(crate) fn release(&self, conn: DatanodeConnection) {
-        let expire_at = Utc::now() + DATANODE_CACHE_EXPIRY;
-        let mut cache = self.cache.lock().unwrap();
-        cache
+    pub(crate) fn release(self: &Arc<Self>, conn: DatanodeConnection) {
+        if self.capacity == 0 {
+            return;
+        }
+
+        let capacity_permit = match Arc::clone(&self.capacity_permits).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                // If another thread checked out an idle connection after the
+                // first permit attempt, there may be no entry left to evict,
+                // but its permit is available. Retry either way.
+                self.evict_one();
+                Arc::clone(&self.capacity_permits).try_acquire_owned().ok()
+            }
+        };
+        let Some(capacity_permit) = capacity_permit else {
+            #[cfg(feature = "integration-test")]
+            crate::test::DATANODE_CONNECTION_CACHE_REJECTED
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        };
+
+        let shard_index = self.shard(&conn.url);
+        lock_unpoisoned(&self.shards[shard_index])
             .entry(conn.url.clone())
             .or_default()
-            .push_back((expire_at, conn));
+            .push_back(CachedDatanodeConnection {
+                released_at: Instant::now(),
+                connection: conn,
+                _capacity_permit: capacity_permit,
+            });
+        self.connection_available.notify_one();
+        self.start_cleanup();
+    }
+
+    fn start_cleanup(self: &Arc<Self>) {
+        if self
+            .cleanup_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let weak_cache = Arc::downgrade(self);
+        let expiry = self.expiry;
+        self.handle.spawn(async move {
+            let mut interval = tokio::time::interval(expiry);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Tokio intervals tick immediately once. Consume that tick so the
+            // first cleanup happens after one full expiry period.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let Some(cache) = weak_cache.upgrade() else {
+                    break;
+                };
+                cache.remove_expired();
+            }
+        });
+    }
+
+    fn evict_one(&self) -> bool {
+        let start = self.eviction_cursor.fetch_add(1, Ordering::Relaxed) % self.shards.len();
+        for offset in 0..self.shards.len() {
+            let shard_index = (start + offset) % self.shards.len();
+            let mut shard = lock_unpoisoned(&self.shards[shard_index]);
+            let eviction_url = shard
+                .iter()
+                .filter_map(|(url, connections)| {
+                    connections.front().map(|cached| (url, cached.released_at))
+                })
+                .min_by_key(|(_, released_at)| *released_at)
+                .map(|(url, _)| url.clone());
+            let Some(eviction_url) = eviction_url else {
+                continue;
+            };
+            let remove_entry = if let Some(connections) = shard.get_mut(&eviction_url) {
+                connections.pop_front();
+                connections.is_empty()
+            } else {
+                false
+            };
+            if remove_entry {
+                shard.remove(&eviction_url);
+            }
+            return true;
+        }
+        false
     }
 
     fn remove_expired(&self) {
-        let mut cache = self.cache.lock().unwrap();
-        let now = Utc::now();
-        for values in cache.values_mut() {
-            values.retain(|(expire_at, _)| expire_at > &now)
+        for shard in &self.shards {
+            lock_unpoisoned(shard).retain(|_, connections| {
+                #[cfg(feature = "integration-test")]
+                let original_len = connections.len();
+                connections.retain(|cached| cached.released_at.elapsed() < self.expiry);
+                #[cfg(feature = "integration-test")]
+                crate::test::DATANODE_CONNECTION_CACHE_EXPIRED.fetch_add(
+                    (original_len - connections.len()) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                !connections.is_empty()
+            });
         }
     }
 }
@@ -803,18 +1185,23 @@ impl DatanodeConnectionCache {
 #[cfg(test)]
 mod test {
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicI32;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Wake, Waker};
 
     use prost::Message;
-    use tokio::sync::mpsc;
+    use tokio::sync::{Notify, Semaphore, mpsc};
 
     use crate::{
         common::config::Configuration, hdfs::connection::MAX_PACKET_HEADER_SIZE, proto::hdfs,
         security::user::UserInfo,
     };
 
-    use super::{AlignmentContext, CRC32, ReadPacket, RpcConnection, datanode_url};
+    use super::{
+        AlignmentContext, CRC32, CRC32C, ReadPacket, RpcConnection, TotalConnectionPermit,
+        WritePacket, datanode_url, packet_body_length, packet_checksum_length,
+    };
     use crate::HdfsError;
     use bytes::{BufMut, Bytes, BytesMut};
 
@@ -827,6 +1214,54 @@ mod test {
         };
         // Add 4 bytes for size of whole packet and 2 bytes for size of header
         assert_eq!(MAX_PACKET_HEADER_SIZE, header.encoded_len() + 4 + 2);
+    }
+
+    struct PermitCheckingWaker {
+        semaphore: Arc<Semaphore>,
+        called: AtomicBool,
+        permit_was_available: AtomicBool,
+    }
+
+    impl Wake for PermitCheckingWaker {
+        fn wake(self: Arc<Self>) {
+            self.record();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.record();
+        }
+    }
+
+    impl PermitCheckingWaker {
+        fn record(&self) {
+            self.permit_was_available
+                .store(self.semaphore.available_permits() == 1, Ordering::SeqCst);
+            self.called.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn total_connection_permit_releases_capacity_before_notifying() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&semaphore).try_acquire_owned().unwrap();
+        let connection_available = Arc::new(Notify::new());
+        let mut notified = Box::pin(connection_available.notified());
+        let checker = Arc::new(PermitCheckingWaker {
+            semaphore,
+            called: AtomicBool::new(false),
+            permit_was_available: AtomicBool::new(false),
+        });
+        let waker = Waker::from(Arc::clone(&checker));
+        let mut context = Context::from_waker(&waker);
+        assert_eq!(notified.as_mut().poll(&mut context), Poll::Pending);
+
+        drop(TotalConnectionPermit {
+            permit: Some(permit),
+            connection_available: Arc::clone(&connection_available),
+        });
+
+        assert!(checker.called.load(Ordering::SeqCst));
+        assert!(checker.permit_was_available.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -975,6 +1410,11 @@ mod test {
     }
 
     #[test]
+    fn test_crc32c_software_fallback() {
+        assert_eq!(CRC32C.checksum(b"123456789"), 0xE3069283);
+    }
+
+    #[test]
     fn test_crc32_multiple_chunks() {
         let info = checksum_info(hdfs::ChecksumTypeProto::ChecksumCrc32, 4);
         let checksums = [
@@ -995,5 +1435,68 @@ mod test {
             .get_data(&info)
             .unwrap_err();
         assert!(matches!(err, HdfsError::ChecksumError));
+    }
+
+    #[test]
+    fn test_crc32c_multiple_chunks_and_partial_tail() {
+        let info = checksum_info(hdfs::ChecksumTypeProto::ChecksumCrc32c, 4);
+        let checksums = [
+            crc32c::crc32c(b"1234"),
+            crc32c::crc32c(b"5678"),
+            crc32c::crc32c(b"9"),
+        ];
+        let data = read_packet(b"123456789", &checksums)
+            .get_data(&info)
+            .unwrap();
+        assert_eq!(data, Bytes::from_static(b"123456789"));
+    }
+
+    #[test]
+    fn test_invalid_packet_lengths() {
+        assert!(matches!(
+            packet_body_length(3),
+            Err(HdfsError::DataTransferError(_))
+        ));
+        assert!(matches!(
+            packet_checksum_length(8, -1),
+            Err(HdfsError::DataTransferError(_))
+        ));
+        assert!(matches!(
+            packet_checksum_length(8, 9),
+            Err(HdfsError::DataTransferError(_))
+        ));
+    }
+
+    #[test]
+    fn test_invalid_checksum_metadata() {
+        let missing_checksum = checksum_info(hdfs::ChecksumTypeProto::ChecksumCrc32c, 4);
+        let err = read_packet(b"123456789", &[crc32c::crc32c(b"1234")])
+            .get_data(&missing_checksum)
+            .unwrap_err();
+        assert!(matches!(err, HdfsError::ChecksumError));
+
+        let zero_chunk_size = checksum_info(hdfs::ChecksumTypeProto::ChecksumCrc32c, 0);
+        let err = read_packet(b"123456789", &[])
+            .get_data(&zero_chunk_size)
+            .unwrap_err();
+        assert!(matches!(err, HdfsError::ChecksumError));
+    }
+
+    #[test]
+    fn test_write_packet_crc32c_checksums() {
+        let mut packet = WritePacket::empty(0, 0, 4, 128);
+        packet.data.extend_from_slice(b"123456789");
+
+        let checksums = packet.calculate_checksum();
+        let expected = [
+            crc32c::crc32c(b"1234"),
+            crc32c::crc32c(b"5678"),
+            crc32c::crc32c(b"9"),
+        ];
+        let actual = checksums
+            .chunks_exact(4)
+            .map(|chunk| u32::from_be_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 }

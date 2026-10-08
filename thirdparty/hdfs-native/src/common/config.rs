@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use dns_lookup::lookup_addr;
 use log::debug;
@@ -28,6 +29,13 @@ const DFS_CLIENT_FAILOVER_SLEEP_MAX_MILLIS: &str = "dfs.client.failover.sleep.ma
 const DFS_CLIENT_FAILOVER_PROXY_PROVIDER: &str = "dfs.client.failover.proxy.provider";
 const DFS_DATA_TRANSFER_PROTECTION: &str = "dfs.data.transfer.protection";
 const DFS_CLIENT_USE_DATANODE_HOSTNAME: &str = "dfs.client.use.datanode.hostname";
+const DFS_CLIENT_SOCKET_TIMEOUT: &str = "dfs.client.socket-timeout";
+const DFS_CLIENT_MAX_BLOCK_ACQUIRE_FAILURES: &str = "dfs.client.max.block.acquire.failures";
+const DFS_CLIENT_RETRY_WINDOW_BASE: &str = "dfs.client.retry.window.base";
+const DFS_NAMENODE_STALE_DATANODE_INTERVAL: &str = "dfs.namenode.stale.datanode.interval";
+const DFS_NAMENODE_AVOID_SLOW_DATANODE_FOR_READ: &str = "dfs.namenode.avoid.read.slow.datanode";
+const DFS_NAMENODE_READ_CONSIDER_LOAD: &str = "dfs.namenode.read.considerLoad";
+const DFS_NAMENODE_READ_CONSIDER_STORAGE_TYPE: &str = "dfs.namenode.read.considerStorageType";
 
 const HADOOP_SECURITY_AUTHENTICATION: &str = "hadoop.security.authentication";
 
@@ -91,6 +99,23 @@ impl Configuration {
         self.get_boolean(DFS_CLIENT_USE_DATANODE_HOSTNAME, false)
     }
 
+    pub(crate) fn datanode_socket_timeout(&self) -> Option<Duration> {
+        let timeout_ms = self.get_u64(DFS_CLIENT_SOCKET_TIMEOUT, 60_000);
+        (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms))
+    }
+
+    pub(crate) fn stale_datanode_interval(&self) -> Duration {
+        Duration::from_millis(self.get_u64(DFS_NAMENODE_STALE_DATANODE_INTERVAL, 30_000))
+    }
+
+    /// Whether the NameNode replica order carries priority information that is
+    /// not completely represented in `DatanodeInfoProto`.
+    pub(crate) fn namenode_replica_order_is_priority_aware(&self) -> bool {
+        self.get_boolean(DFS_NAMENODE_AVOID_SLOW_DATANODE_FOR_READ, false)
+            || self.get_boolean(DFS_NAMENODE_READ_CONSIDER_LOAD, false)
+            || self.get_boolean(DFS_NAMENODE_READ_CONSIDER_STORAGE_TYPE, false)
+    }
+
     fn get_u64(&self, key: &str, default: u64) -> u64 {
         self.get(key)
             .and_then(|v| v.parse().ok())
@@ -107,6 +132,15 @@ impl Configuration {
 
     pub(crate) fn failover_sleep_max_millis(&self) -> u64 {
         self.get_u64(DFS_CLIENT_FAILOVER_SLEEP_MAX_MILLIS, 15000)
+    }
+
+    pub(crate) fn max_block_acquire_failures(&self) -> usize {
+        usize::try_from(self.get_u64(DFS_CLIENT_MAX_BLOCK_ACQUIRE_FAILURES, 3))
+            .unwrap_or(usize::MAX)
+    }
+
+    pub(crate) fn retry_window_base_millis(&self) -> u64 {
+        self.get_u64(DFS_CLIENT_RETRY_WINDOW_BASE, 3000)
     }
 
     pub(crate) fn get_urls_for_nameservice(&self, nameservice: &str) -> Result<Vec<String>> {
@@ -420,17 +454,22 @@ impl EntityResolver {
 mod test {
     use std::collections::HashMap;
     use std::net::IpAddr;
+    use std::time::Duration;
 
     use dns_lookup::lookup_addr;
 
     use crate::common::config::DFS_CLIENT_FAILOVER_RESOLVER_USE_FQDN;
 
     use super::{
-        Configuration, DFS_CLIENT_FAILOVER_RESOLVE_NEEDED, DFS_CLIENT_USE_DATANODE_HOSTNAME,
+        Configuration, DFS_CLIENT_FAILOVER_RESOLVE_NEEDED, DFS_CLIENT_MAX_BLOCK_ACQUIRE_FAILURES,
+        DFS_CLIENT_RETRY_WINDOW_BASE, DFS_CLIENT_SOCKET_TIMEOUT, DFS_CLIENT_USE_DATANODE_HOSTNAME,
         DFS_CLIENT_WRITE_REPLACE_DATANODE_ON_FAILURE_BEST_EFFORT_KEY,
         DFS_CLIENT_WRITE_REPLACE_DATANODE_ON_FAILURE_ENABLE_KEY,
-        DFS_CLIENT_WRITE_REPLACE_DATANODE_ON_FAILURE_POLICY_KEY, EntityResolver,
-        HA_NAMENODE_RPC_ADDRESS_PREFIX, HA_NAMENODES_PREFIX, VIEWFS_MOUNTTABLE_PREFIX,
+        DFS_CLIENT_WRITE_REPLACE_DATANODE_ON_FAILURE_POLICY_KEY,
+        DFS_NAMENODE_AVOID_SLOW_DATANODE_FOR_READ, DFS_NAMENODE_READ_CONSIDER_LOAD,
+        DFS_NAMENODE_READ_CONSIDER_STORAGE_TYPE, DFS_NAMENODE_STALE_DATANODE_INTERVAL,
+        EntityResolver, HA_NAMENODE_RPC_ADDRESS_PREFIX, HA_NAMENODES_PREFIX,
+        VIEWFS_MOUNTTABLE_PREFIX,
     };
 
     #[test]
@@ -681,6 +720,86 @@ mod test {
             .collect(),
         };
         assert!(config.use_datanode_hostname());
+    }
+
+    #[test]
+    fn test_read_retry_config() {
+        let config = Configuration {
+            map: HashMap::new(),
+        };
+        assert_eq!(config.max_block_acquire_failures(), 3);
+        assert_eq!(config.retry_window_base_millis(), 3000);
+
+        let config = Configuration {
+            map: [
+                (
+                    DFS_CLIENT_MAX_BLOCK_ACQUIRE_FAILURES.to_string(),
+                    "5".to_string(),
+                ),
+                (DFS_CLIENT_RETRY_WINDOW_BASE.to_string(), "7".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(config.max_block_acquire_failures(), 5);
+        assert_eq!(config.retry_window_base_millis(), 7);
+    }
+
+    #[test]
+    fn test_datanode_socket_timeout_config() {
+        let config = Configuration {
+            map: HashMap::new(),
+        };
+        assert_eq!(
+            config.datanode_socket_timeout(),
+            Some(Duration::from_secs(60))
+        );
+
+        let config = Configuration {
+            map: [(DFS_CLIENT_SOCKET_TIMEOUT.to_string(), "25".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(
+            config.datanode_socket_timeout(),
+            Some(Duration::from_millis(25))
+        );
+
+        let config = Configuration {
+            map: [(DFS_CLIENT_SOCKET_TIMEOUT.to_string(), "0".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(config.datanode_socket_timeout(), None);
+    }
+
+    #[test]
+    fn test_replica_priority_config() {
+        let config = Configuration {
+            map: HashMap::new(),
+        };
+        assert_eq!(config.stale_datanode_interval(), Duration::from_secs(30));
+        assert!(!config.namenode_replica_order_is_priority_aware());
+
+        for key in [
+            DFS_NAMENODE_AVOID_SLOW_DATANODE_FOR_READ,
+            DFS_NAMENODE_READ_CONSIDER_LOAD,
+            DFS_NAMENODE_READ_CONSIDER_STORAGE_TYPE,
+        ] {
+            let config = Configuration {
+                map: [
+                    (
+                        DFS_NAMENODE_STALE_DATANODE_INTERVAL.to_string(),
+                        "25".to_string(),
+                    ),
+                    (key.to_string(), "true".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            };
+            assert_eq!(config.stale_datanode_interval(), Duration::from_millis(25));
+            assert!(config.namenode_replica_order_is_priority_aware());
+        }
     }
 
     #[test]

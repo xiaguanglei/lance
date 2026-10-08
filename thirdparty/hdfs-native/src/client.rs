@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::stream::BoxStream;
 use futures::{StreamExt, stream};
@@ -8,10 +8,12 @@ use tokio::runtime::{Handle, Runtime};
 use url::Url;
 
 use crate::acl::{AclEntry, AclStatus};
+use crate::block_locations::{BlockLocationsCache, load_uncached};
 use crate::common::config::{self, Configuration};
 use crate::ec::resolve_ec_policy;
 use crate::error::{HdfsError, Result};
 use crate::file::{FileReader, FileWriter};
+use crate::hdfs::connection::DatanodeConnectionCache;
 use crate::hdfs::crypto::FileCryptoCodec;
 use crate::hdfs::protocol::NamenodeProtocol;
 use crate::hdfs::proxy::NameServiceProxy;
@@ -26,6 +28,13 @@ use crate::proto::hdfs::{ContentSummaryProto, FileEncryptionInfoProto, HdfsFileS
 const TRASH_ROOT_DIR: &str = ".Trash";
 const TRASH_CURRENT_DIR: &str = "Current";
 const TRASH_DIR_PERMISSION: u32 = 0o700;
+const BLOCK_LOCATIONS_CACHE_CAPACITY: &str = "dfs.client.read.block-locations-cache.capacity";
+const BLOCK_LOCATIONS_CACHE_TTL_MS: &str = "dfs.client.read.block-locations-cache.ttl-ms";
+const DATANODE_SOCKET_CACHE_CAPACITY: &str = "dfs.client.socketcache.capacity";
+const DATANODE_SOCKET_CACHE_EXPIRY_MS: &str = "dfs.client.socketcache.expiryMsec";
+const DATANODE_SOCKET_CACHE_MAX_TOTAL: &str = "dfs.client.socketcache.maxTotal";
+const DATANODE_CACHED_CONNECTION_RETRIES: &str = "dfs.client.cached.conn.retry";
+const DATANODE_REPLICA_ROUND_ROBIN: &str = "dfs.client.read.replica-round-robin";
 
 #[derive(Clone)]
 pub struct WriteOptions {
@@ -420,6 +429,8 @@ pub struct Client {
     // Store the runtime used for spawning all internal tasks. If we are not created
     // inside a tokio runtime, we will create our own to use.
     rt_holder: RuntimeHolder,
+    block_locations_cache: Option<Arc<BlockLocationsCache>>,
+    datanode_connection_cache: Arc<DatanodeConnectionCache>,
     // Built once at client construction from `hadoop.security.key.provider.path`.
     // `None` means TDE is not configured; reads of encrypted files will error.
     #[cfg(feature = "kms")]
@@ -427,6 +438,30 @@ pub struct Client {
 }
 
 impl Client {
+    fn parse_cache_config<T>(config: &Configuration, key: &str, default: T) -> Result<T>
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Display,
+    {
+        match config.get(key) {
+            Some(value) => value.parse().map_err(|error| {
+                HdfsError::InvalidArgument(format!("invalid value '{value}' for {key}: {error}"))
+            }),
+            None => Ok(default),
+        }
+    }
+
+    fn parse_bool_config(config: &Configuration, key: &str, default: bool) -> Result<bool> {
+        match config.get(key) {
+            None => Ok(default),
+            Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+            Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+            Some(value) => Err(HdfsError::InvalidArgument(format!(
+                "invalid value '{value}' for {key}: expected true or false"
+            ))),
+        }
+    }
+
     fn default_fs(config: &Configuration) -> Result<Url> {
         let url = config
             .get(config::DEFAULT_FS)
@@ -456,9 +491,44 @@ impl Client {
             url.clone()
         };
 
+        let cache_capacity =
+            Self::parse_cache_config(&config, BLOCK_LOCATIONS_CACHE_CAPACITY, 0_usize)?;
+        let cache_ttl_ms =
+            Self::parse_cache_config(&config, BLOCK_LOCATIONS_CACHE_TTL_MS, 60_000_u64)?;
+        let block_locations_cache =
+            BlockLocationsCache::new(cache_capacity, Duration::from_millis(cache_ttl_ms))
+                .map(Arc::new);
+        let datanode_cache_capacity =
+            Self::parse_cache_config(&config, DATANODE_SOCKET_CACHE_CAPACITY, 16_usize)?;
+        let datanode_cache_expiry_ms =
+            Self::parse_cache_config(&config, DATANODE_SOCKET_CACHE_EXPIRY_MS, 3_000_u64)?;
+        let datanode_cache_max_total =
+            Self::parse_cache_config(&config, DATANODE_SOCKET_CACHE_MAX_TOTAL, 0_usize)?;
+        let datanode_cached_connection_retries =
+            Self::parse_cache_config(&config, DATANODE_CACHED_CONNECTION_RETRIES, 3_usize)?;
+        let datanode_replica_round_robin =
+            Self::parse_bool_config(&config, DATANODE_REPLICA_ROUND_ROBIN, false)?;
+        if datanode_cache_capacity > 0 && datanode_cache_expiry_ms == 0 {
+            return Err(HdfsError::InvalidArgument(format!(
+                "{DATANODE_SOCKET_CACHE_EXPIRY_MS} must be greater than zero when the DataNode connection cache is enabled"
+            )));
+        }
+        if datanode_cache_max_total > 0 && datanode_cache_max_total < datanode_cache_capacity {
+            return Err(HdfsError::InvalidArgument(format!(
+                "{DATANODE_SOCKET_CACHE_MAX_TOTAL} must be zero (unlimited) or greater than or equal to {DATANODE_SOCKET_CACHE_CAPACITY}"
+            )));
+        }
         let config = Arc::new(config);
 
         let rt_holder = RuntimeHolder::new(rt);
+        let datanode_connection_cache = DatanodeConnectionCache::new(
+            datanode_cache_capacity,
+            datanode_cache_max_total,
+            Duration::from_millis(datanode_cache_expiry_ms),
+            datanode_cached_connection_retries,
+            datanode_replica_round_robin,
+            &rt_holder.get_handle(),
+        );
 
         let user_info = if config.security_enabled()
             && let Some(principal) = auth
@@ -523,6 +593,8 @@ impl Client {
             mount_table: Arc::new(mount_table),
             config,
             rt_holder,
+            block_locations_cache,
+            datanode_connection_cache,
             #[cfg(feature = "kms")]
             kms_client,
         })
@@ -737,14 +809,28 @@ impl Client {
 
     /// Opens a file reader for the file at `path`. Path should not include a scheme.
     pub async fn read(&self, path: &str) -> Result<FileReader> {
-        let (link, resolved_path) = self.mount_table.resolve(path);
-        // Get all block locations. Length is actually a signed value, but the proto uses an unsigned value
-        let located_info = link
-            .protocol
-            .get_block_locations(&resolved_path, 0, i64::MAX as u64)
-            .await?;
+        #[cfg(feature = "integration-test")]
+        let started_at = std::time::Instant::now();
+        #[cfg(feature = "integration-test")]
+        crate::test::FILE_READER_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        if let Some(locations) = located_info.locations {
+        let (link, resolved_path) = self.mount_table.resolve(path);
+        let (located_blocks, cache_hit) = if let Some(cache) = &self.block_locations_cache {
+            cache.get_or_load(&link.protocol, &resolved_path).await?
+        } else {
+            (load_uncached(&link.protocol, &resolved_path).await?, false)
+        };
+        #[cfg(feature = "integration-test")]
+        if cache_hit {
+            crate::test::BLOCK_LOCATIONS_CACHE_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "integration-test"))]
+        let _ = cache_hit;
+
+        let locations = located_blocks.current();
+
+        {
             let ec_schema = if let Some(ec_policy) = locations.ec_policy.as_ref() {
                 Some(resolve_ec_policy(ec_policy)?)
             } else {
@@ -755,16 +841,22 @@ impl Client {
                 .build_crypto_codec(locations.file_encryption_info.as_ref())
                 .await?;
 
-            Ok(FileReader::new(
+            let reader = FileReader::new(
                 Arc::clone(&link.protocol),
-                locations,
+                resolved_path,
+                located_blocks,
                 ec_schema,
                 Arc::clone(&self.config),
                 self.rt_holder.get_handle(),
+                Arc::clone(&self.datanode_connection_cache),
                 crypto,
-            ))
-        } else {
-            Err(HdfsError::FileNotFound(path.to_string()))
+            );
+            #[cfg(feature = "integration-test")]
+            crate::test::FILE_READER_OPEN_NANOS.fetch_add(
+                started_at.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(reader)
         }
     }
 
@@ -811,8 +903,11 @@ impl Client {
         let write_options = write_options.as_ref();
 
         let (link, resolved_path) = self.mount_table.resolve(src);
+        if let Some(cache) = &self.block_locations_cache {
+            cache.invalidate(&link.protocol, &resolved_path);
+        }
 
-        let create_response = link
+        let create_result = link
             .protocol
             .create(
                 &resolved_path,
@@ -822,7 +917,11 @@ impl Client {
                 write_options.replication,
                 write_options.block_size,
             )
-            .await?;
+            .await;
+        if let Some(cache) = &self.block_locations_cache {
+            cache.invalidate(&link.protocol, &resolved_path);
+        }
+        let create_response = create_result?;
 
         match create_response.fs {
             Some(status) => {
@@ -863,15 +962,22 @@ impl Client {
     /// coded, a new block will be created.
     pub async fn append(&self, src: &str) -> Result<FileWriter> {
         let (link, resolved_path) = self.mount_table.resolve(src);
+        if let Some(cache) = &self.block_locations_cache {
+            cache.invalidate(&link.protocol, &resolved_path);
+        }
 
         // Assume the file is replicated and try to append to the current block. If the file is
         // erasure coded, then try again by appending to a new block.
-        let append_response = match link.protocol.append(&resolved_path, false).await {
+        let append_result = match link.protocol.append(&resolved_path, false).await {
             Err(HdfsError::RPCError(class, msg)) if Self::needs_new_block(&class, &msg) => {
-                link.protocol.append(&resolved_path, true).await?
+                link.protocol.append(&resolved_path, true).await
             }
-            resp => resp?,
+            response => response,
         };
+        if let Some(cache) = &self.block_locations_cache {
+            cache.invalidate(&link.protocol, &resolved_path);
+        }
+        let append_response = append_result?;
 
         match append_response.stat {
             Some(status) => {
@@ -934,7 +1040,7 @@ impl Client {
         let (src_link, src_resolved_path) = self.mount_table.resolve(src);
         let (dst_link, dst_resolved_path) = self.mount_table.resolve(dst);
         if src_link.viewfs_path == dst_link.viewfs_path {
-            src_link
+            let result = src_link
                 .protocol
                 .rename(
                     &src_resolved_path,
@@ -943,7 +1049,12 @@ impl Client {
                     move_to_trash,
                 )
                 .await
-                .map(|_| ())
+                .map(|_| ());
+            if let Some(cache) = &self.block_locations_cache {
+                cache.invalidate(&src_link.protocol, &src_resolved_path);
+                cache.invalidate(&dst_link.protocol, &dst_resolved_path);
+            }
+            result
         } else {
             Err(HdfsError::InvalidArgument(
                 "Cannot rename across different name services".to_string(),
@@ -960,10 +1071,15 @@ impl Client {
     /// directory, this will fail. Returns `Ok(true)` if it was successfully deleted.
     pub async fn delete(&self, path: &str, recursive: bool) -> Result<bool> {
         let (link, resolved_path) = self.mount_table.resolve(path);
-        link.protocol
+        let result = link
+            .protocol
             .delete(&resolved_path, recursive)
             .await
-            .map(|r| r.result)
+            .map(|r| r.result);
+        if let Some(cache) = &self.block_locations_cache {
+            cache.invalidate(&link.protocol, &resolved_path);
+        }
+        result
     }
 
     /// Moves a file or directory at `path` into the user's trash. Returns `Ok(Some(path))` if
@@ -1091,8 +1207,11 @@ impl Client {
         let result = link
             .protocol
             .set_replication(&resolved_path, replication)
-            .await?
-            .result;
+            .await;
+        if let Some(cache) = &self.block_locations_cache {
+            cache.invalidate(&link.protocol, &resolved_path);
+        }
+        let result = result?.result;
 
         Ok(result)
     }
@@ -1513,6 +1632,7 @@ mod test {
     use url::Url;
 
     use crate::{
+        HdfsError,
         client::ClientBuilder,
         common::config::Configuration,
         hdfs::{protocol::NamenodeProtocol, proxy::NameServiceProxy},
@@ -1573,6 +1693,79 @@ mod test {
                 .build()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_block_locations_cache_configuration() {
+        let disabled = ClientBuilder::new()
+            .with_url("hdfs://127.0.0.1:9000")
+            .build()
+            .unwrap();
+        assert!(disabled.block_locations_cache.is_none());
+
+        let enabled = ClientBuilder::new()
+            .with_url("hdfs://127.0.0.1:9000")
+            .with_config([
+                ("dfs.client.read.block-locations-cache.capacity", "8"),
+                ("dfs.client.read.block-locations-cache.ttl-ms", "1000"),
+            ])
+            .build()
+            .unwrap();
+        assert!(enabled.block_locations_cache.is_some());
+
+        let invalid = ClientBuilder::new()
+            .with_url("hdfs://127.0.0.1:9000")
+            .with_config([(
+                "dfs.client.read.block-locations-cache.capacity",
+                "not-a-number",
+            )])
+            .build();
+        assert!(matches!(invalid, Err(HdfsError::InvalidArgument(_))));
+
+        let invalid_socket_capacity = ClientBuilder::new()
+            .with_url("hdfs://127.0.0.1:9000")
+            .with_config([("dfs.client.socketcache.capacity", "not-a-number")])
+            .build();
+        assert!(matches!(
+            invalid_socket_capacity,
+            Err(HdfsError::InvalidArgument(_))
+        ));
+
+        let zero_socket_expiry = ClientBuilder::new()
+            .with_url("hdfs://127.0.0.1:9000")
+            .with_config([
+                ("dfs.client.socketcache.capacity", "1"),
+                ("dfs.client.socketcache.expiryMsec", "0"),
+            ])
+            .build();
+        assert!(matches!(
+            zero_socket_expiry,
+            Err(HdfsError::InvalidArgument(_))
+        ));
+
+        let invalid_socket_total = ClientBuilder::new()
+            .with_url("hdfs://127.0.0.1:9000")
+            .with_config([
+                ("dfs.client.socketcache.capacity", "32"),
+                ("dfs.client.socketcache.maxTotal", "16"),
+            ])
+            .build();
+        assert!(matches!(
+            invalid_socket_total,
+            Err(HdfsError::InvalidArgument(_))
+        ));
+
+        let uppercase_bool = ClientBuilder::new()
+            .with_url("hdfs://127.0.0.1:9000")
+            .with_config([("dfs.client.read.replica-round-robin", "TRUE")])
+            .build();
+        assert!(uppercase_bool.is_ok());
+
+        let invalid_bool = ClientBuilder::new()
+            .with_url("hdfs://127.0.0.1:9000")
+            .with_config([("dfs.client.read.replica-round-robin", "sometimes")])
+            .build();
+        assert!(matches!(invalid_bool, Err(HdfsError::InvalidArgument(_))));
     }
 
     #[test]

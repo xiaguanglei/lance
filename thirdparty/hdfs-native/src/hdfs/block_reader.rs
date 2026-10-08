@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
+    io,
     sync::Arc,
+    time::Duration,
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -11,7 +14,7 @@ use futures::{
 use log::{debug, warn};
 use tokio::{
     runtime::Handle,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::{self, Receiver},
     task::JoinHandle,
 };
 
@@ -19,7 +22,7 @@ use crate::{
     HdfsError, Result,
     common::config::Configuration,
     ec::EcSchema,
-    hdfs::connection::{DATANODE_CACHE, DatanodeConnection, Op},
+    hdfs::connection::{DatanodeConnection, DatanodeConnectionCache, Op},
     hdfs::crypto::{FileCipher, FileCryptoCodec},
     proto::{
         common,
@@ -35,6 +38,27 @@ use super::protocol::NamenodeProtocol;
 // The number of packets to queue up on reads
 const READ_PACKET_BUFFER_LEN: usize = 100;
 
+type ReadPacket = (PacketHeaderProto, Bytes);
+
+async fn with_datanode_timeout<T>(
+    timeout: Option<Duration>,
+    operation: &'static str,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, future).await.map_err(|_| {
+            HdfsError::IOError(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "DataNode {operation} timed out after {} ms",
+                    timeout.as_millis()
+                ),
+            ))
+        })?,
+        None => future.await,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_block_stream(
     protocol: Arc<NamenodeProtocol>,
@@ -44,18 +68,36 @@ pub(crate) fn get_block_stream(
     ec_schema: Option<EcSchema>,
     config: Arc<Configuration>,
     handle: Handle,
+    datanode_connection_cache: Arc<DatanodeConnectionCache>,
     crypto: Option<Arc<FileCryptoCodec>>,
 ) -> BoxStream<'static, Result<Bytes>> {
     if let Some(ec_schema) = ec_schema {
         StripedBlockStream::new(
-            protocol, block, offset, len, ec_schema, config, handle, crypto,
+            protocol,
+            block,
+            offset,
+            len,
+            ec_schema,
+            config,
+            handle,
+            datanode_connection_cache,
+            crypto,
         )
         .into_stream()
         .boxed()
     } else {
-        ReplicatedBlockStream::new(protocol, block, offset, len, config, handle, crypto)
-            .into_stream()
-            .boxed()
+        ReplicatedBlockStream::new(
+            protocol,
+            block,
+            offset,
+            len,
+            config,
+            handle,
+            datanode_connection_cache,
+            crypto,
+        )
+        .into_stream()
+        .boxed()
     }
 }
 
@@ -70,6 +112,7 @@ async fn connect_and_send(
     len: u64,
     config: &Configuration,
     handle: &Handle,
+    datanode_connection_cache: &DatanodeConnectionCache,
 ) -> Result<(DatanodeConnection, BlockOpResponseProto)> {
     #[cfg(feature = "integration-test")]
     if crate::test::DATANODE_CONNECT_FAULT_INJECTOR.swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -79,31 +122,40 @@ async fn connect_and_send(
         ));
     }
 
-    let mut remaining_attempts = 2;
-    while remaining_attempts > 0 {
-        if let Some(mut conn) = DATANODE_CACHE.get(datanode_id, config) {
-            let message = hdfs::OpReadBlockProto {
-                header: conn.build_header(block, Some(token.clone())),
-                offset,
-                len,
-                send_checksums: Some(true),
-                ..Default::default()
-            };
-            debug!("Block read op request {:?}", message);
-            match conn.send(Op::ReadBlock, &message).await {
-                Ok(response) => {
-                    debug!("Block read op response {:?}", response);
-                    return Ok((conn, response));
-                }
-                Err(e) => {
-                    warn!("Failed to use cached connection: {:?}", e);
+    let cached_connection_retries = datanode_connection_cache.cached_connection_retries();
+    let mut cached_connection_failures = 0;
+    let total_capacity_permit = loop {
+        let acquisition = datanode_connection_cache
+            .acquire(
+                datanode_id,
+                config,
+                cached_connection_failures < cached_connection_retries,
+            )
+            .await;
+        match acquisition.connection {
+            Some(mut conn) => {
+                let message = hdfs::OpReadBlockProto {
+                    header: conn.build_header(block, Some(token.clone())),
+                    offset,
+                    len,
+                    send_checksums: Some(true),
+                    ..Default::default()
+                };
+                debug!("Block read op request {:?}", message);
+                match conn.send(Op::ReadBlock, &message).await {
+                    Ok(response) => {
+                        debug!("Block read op response {:?}", response);
+                        return Ok((conn, response));
+                    }
+                    Err(e) => {
+                        warn!("Failed to use cached connection: {:?}", e);
+                        cached_connection_failures += 1;
+                    }
                 }
             }
-        } else {
-            break;
+            None => break acquisition.total_capacity_permit,
         }
-        remaining_attempts -= 1;
-    }
+    };
     let mut conn = DatanodeConnection::connect(
         datanode_id,
         &token,
@@ -112,6 +164,7 @@ async fn connect_and_send(
         handle,
     )
     .await?;
+    conn.set_total_capacity_permit(total_capacity_permit);
 
     let message = hdfs::OpReadBlockProto {
         header: conn.build_header(block, Some(token)),
@@ -127,6 +180,42 @@ async fn connect_and_send(
     Ok((conn, response))
 }
 
+struct PacketListener {
+    receiver: Receiver<ReadPacket>,
+    task: Option<JoinHandle<Result<DatanodeConnection>>>,
+}
+
+impl PacketListener {
+    async fn finish(&mut self) -> Result<DatanodeConnection> {
+        let task = self.task.as_mut().ok_or_else(|| {
+            HdfsError::InternalError("DataNode packet listener task was missing".to_string())
+        })?;
+        task.await.map_err(|error| {
+            HdfsError::InternalError(format!("DataNode packet listener task failed: {error}"))
+        })?
+    }
+
+    async fn abort(mut self) {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        task.abort();
+        if let Err(error) = task.await
+            && !error.is_cancelled()
+        {
+            warn!("DataNode packet listener failed while stopping: {error}");
+        }
+    }
+}
+
+impl Drop for PacketListener {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
+    }
+}
+
 struct ReplicatedBlockStream {
     protocol: Arc<NamenodeProtocol>,
     block: hdfs::LocatedBlockProto,
@@ -134,17 +223,65 @@ struct ReplicatedBlockStream {
     len: usize,
     config: Arc<Configuration>,
     handle: Handle,
+    datanode_connection_cache: Arc<DatanodeConnectionCache>,
     // Built once per block from the shared codec so the AES key schedule is
     // computed a single time rather than per packet.
     cipher: Option<FileCipher>,
 
-    listener: Option<JoinHandle<Result<DatanodeConnection>>>,
-    sender: Sender<Result<(PacketHeaderProto, Bytes)>>,
-    receiver: Receiver<Result<(PacketHeaderProto, Bytes)>>,
+    listener: Option<PacketListener>,
+    replica_order: Vec<usize>,
     next_replica: usize,
 }
 
+fn replica_order(
+    locations: &[hdfs::DatanodeInfoProto],
+    rotation: Option<usize>,
+    stale_interval: Duration,
+    preserve_namenode_order: bool,
+) -> Vec<usize> {
+    let order = (0..locations.len()).collect::<Vec<_>>();
+    let Some(rotation) = rotation else {
+        return order;
+    };
+    if preserve_namenode_order {
+        return order;
+    }
+
+    // Comparing heartbeats to the freshest replica rather than wall clock
+    // keeps this valid when block locations are cached and avoids relying on
+    // clock synchronization between the NameNode and this client.
+    let Some(freshest_update) = locations
+        .iter()
+        .filter_map(|location| location.last_update)
+        .max()
+    else {
+        return order;
+    };
+    let stale_interval_ms = u64::try_from(stale_interval.as_millis()).unwrap_or(u64::MAX);
+    let normal = hdfs::datanode_info_proto::AdminState::Normal as i32;
+
+    let (mut healthy, degraded): (Vec<_>, Vec<_>) = order.into_iter().partition(|index| {
+        let location = &locations[*index];
+        location.admin_state.unwrap_or(normal) == normal
+            && location.last_update.is_some_and(|last_update| {
+                freshest_update.saturating_sub(last_update) <= stale_interval_ms
+            })
+    });
+
+    if healthy.is_empty() {
+        return degraded;
+    }
+
+    if healthy.len() > 1 {
+        let healthy_len = healthy.len();
+        healthy.rotate_left(rotation % healthy_len);
+    }
+    healthy.extend(degraded);
+    healthy
+}
+
 impl ReplicatedBlockStream {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         protocol: Arc<NamenodeProtocol>,
         block: hdfs::LocatedBlockProto,
@@ -152,9 +289,15 @@ impl ReplicatedBlockStream {
         len: usize,
         config: Arc<Configuration>,
         handle: Handle,
+        datanode_connection_cache: Arc<DatanodeConnectionCache>,
         crypto: Option<Arc<FileCryptoCodec>>,
     ) -> Self {
-        let (sender, receiver) = mpsc::channel(READ_PACKET_BUFFER_LEN);
+        let replica_order = replica_order(
+            &block.locs,
+            datanode_connection_cache.next_replica_offset(),
+            config.stale_datanode_interval(),
+            config.namenode_replica_order_is_priority_aware(),
+        );
 
         Self {
             protocol,
@@ -163,10 +306,10 @@ impl ReplicatedBlockStream {
             len,
             config,
             handle,
+            datanode_connection_cache,
             cipher: crypto.as_ref().map(|c| c.make_cipher()),
             listener: None,
-            sender,
-            receiver,
+            replica_order,
             next_replica: 0,
         }
     }
@@ -175,14 +318,14 @@ impl ReplicatedBlockStream {
         &mut self,
     ) -> Result<(DatanodeConnection, Option<ReadOpChecksumInfoProto>)> {
         loop {
-            if self.next_replica >= self.block.locs.len() {
+            if self.next_replica >= self.replica_order.len() {
                 return Err(HdfsError::DataTransferError(format!(
                     "All DataNodes failed: {:?}",
                     self.block.locs
                 )));
             }
 
-            let datanode = &self.block.locs[self.next_replica].id;
+            let datanode = &self.block.locs[self.replica_order[self.next_replica]].id;
 
             self.next_replica += 1;
 
@@ -195,6 +338,7 @@ impl ReplicatedBlockStream {
                 self.len as u64,
                 &self.config,
                 &self.handle,
+                &self.datanode_connection_cache,
             )
             .await
             {
@@ -214,19 +358,6 @@ impl ReplicatedBlockStream {
         }
     }
 
-    async fn next_packet_from_receiver(&mut self) -> Option<Result<(PacketHeaderProto, Bytes)>> {
-        #[cfg(feature = "integration-test")]
-        if crate::test::DATANODE_READ_FAULT_INJECTOR
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Some(Err(HdfsError::IOError(std::io::Error::from(
-                std::io::ErrorKind::UnexpectedEof,
-            ))));
-        }
-
-        self.receiver.recv().await
-    }
-
     async fn next_packet(&mut self) -> Result<Option<Bytes>> {
         // We've finished this read, just return None
         if self.len == 0 {
@@ -242,7 +373,7 @@ impl ReplicatedBlockStream {
                 self.listener = Some(Self::start_packet_listener(
                     connection,
                     checksum_info,
-                    self.sender.clone(),
+                    self.config.datanode_socket_timeout(),
                     &self.handle,
                 ));
                 false
@@ -250,23 +381,43 @@ impl ReplicatedBlockStream {
                 true
             };
 
-            match self.next_packet_from_receiver().await {
-                Some(Ok(data)) => break data,
-                Some(Err(e)) => {
+            let packet = match self.listener.as_mut() {
+                Some(listener) => listener.receiver.recv().await,
+                None => {
+                    return Err(HdfsError::InternalError(
+                        "DataNode packet listener was not started".to_string(),
+                    ));
+                }
+            };
+            let packet = match packet {
+                Some(packet) => Ok(packet),
+                None => {
+                    let mut listener = self.listener.take().ok_or_else(|| {
+                        HdfsError::InternalError(
+                            "DataNode packet listener was not available".to_string(),
+                        )
+                    })?;
+                    match listener.finish().await {
+                        Ok(_connection) => Err(HdfsError::DataTransferError(
+                            "Not enough data returned from DataNode".to_string(),
+                        )),
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+
+            match packet {
+                Ok(data) => break data,
+                Err(error) => {
                     // Some error communicating with datanode, log a warning and then retry on a different Datanode
-                    warn!("Error occurred while reading from DataNode: {:?}", e);
-                    if retry_connection && matches!(e, HdfsError::IOError(_)) {
+                    warn!("Error occurred while reading from DataNode: {error:?}");
+                    if let Some(listener) = self.listener.take() {
+                        listener.abort().await;
+                    }
+                    if retry_connection && matches!(error, HdfsError::IOError(_)) {
                         // Retry transient IO errors on the same DataNode
                         self.next_replica -= 1;
                     }
-                    self.listener = None;
-                }
-                None => {
-                    // This means there's a disconnect between the data we are getting back and what we asked for,
-                    // so just raise an error
-                    return Err(HdfsError::DataTransferError(
-                        "Not enough data returned from DataNode".to_string(),
-                    ));
                 }
             }
         };
@@ -283,8 +434,11 @@ impl ReplicatedBlockStream {
 
         // We've consumed the whole read, there should be no more packets and the listener should complete
         if self.len == 0 {
-            let conn = self.listener.take().unwrap().await.unwrap()?;
-            DATANODE_CACHE.release(conn);
+            let mut listener = self.listener.take().ok_or_else(|| {
+                HdfsError::InternalError("DataNode packet listener was not available".to_string())
+            })?;
+            let conn = listener.finish().await?;
+            self.datanode_connection_cache.release(conn);
         }
 
         let slice = data.slice(packet_offset..(packet_offset + packet_len));
@@ -311,28 +465,66 @@ impl ReplicatedBlockStream {
     fn start_packet_listener(
         mut connection: DatanodeConnection,
         checksum_info: Option<ReadOpChecksumInfoProto>,
-        sender: Sender<Result<(PacketHeaderProto, Bytes)>>,
+        socket_timeout: Option<Duration>,
         handle: &Handle,
-    ) -> JoinHandle<Result<DatanodeConnection>> {
-        handle.spawn(async move {
+    ) -> PacketListener {
+        let (sender, receiver) = mpsc::channel(READ_PACKET_BUFFER_LEN);
+        let task = handle.spawn(async move {
             loop {
-                let next_packet = Self::get_next_packet(&mut connection, checksum_info).await;
-                if next_packet.as_ref().is_ok_and(|(_, data)| data.is_empty()) {
+                let next_packet = with_datanode_timeout(socket_timeout, "packet read", async {
+                    #[cfg(feature = "integration-test")]
+                    let blocker = {
+                        let mut blocker = crate::test::DATANODE_READ_BLOCKER
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        blocker.take()
+                    };
+                    #[cfg(feature = "integration-test")]
+                    if let Some(blocker) = blocker {
+                        blocker.notified().await;
+                    }
+                    #[cfg(feature = "integration-test")]
+                    if crate::test::should_inject_datanode_read_fault() {
+                        return Err(HdfsError::IOError(io::Error::from(
+                            io::ErrorKind::UnexpectedEof,
+                        )));
+                    }
+
+                    Self::get_next_packet(&mut connection, checksum_info).await
+                })
+                .await?;
+                if next_packet.1.is_empty() {
                     // If the packet is empty it means it's the last packet
                     // so tell the DataNode the read was a success and finish this task
-                    connection.send_read_success().await?;
-                    break;
+                    #[cfg(feature = "integration-test")]
+                    let ack_blocker = crate::test::DATANODE_READ_ACK_BLOCKER
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take();
+                    #[cfg(feature = "integration-test")]
+                    if let Some(ack_blocker) = ack_blocker {
+                        ack_blocker.notified().await;
+                    }
+                    with_datanode_timeout(
+                        socket_timeout,
+                        "read acknowledgement",
+                        connection.send_read_success(),
+                    )
+                    .await?;
+                    return Ok(connection);
                 }
 
-                if sender.send(next_packet).await.is_err() {
-                    // The block reader was dropped, so just kill the listener
-                    return Err(HdfsError::DataTransferError(
+                sender.send(next_packet).await.map_err(|_| {
+                    HdfsError::DataTransferError(
                         "Reader was dropped without consuming all data".to_string(),
-                    ));
-                }
+                    )
+                })?;
             }
-            Ok(connection)
-        })
+        });
+        PacketListener {
+            receiver,
+            task: Some(task),
+        }
     }
 
     fn into_stream(self) -> impl Stream<Item = Result<Bytes>> {
@@ -434,6 +626,7 @@ struct StripedBlockStream {
     bytes_to_skip: usize,
     config: Arc<Configuration>,
     handle: Handle,
+    datanode_connection_cache: Arc<DatanodeConnectionCache>,
     ec_schema: EcSchema,
     // Position of the start of the current cell in a single block
     current_block_start: usize,
@@ -459,6 +652,7 @@ impl StripedBlockStream {
         ec_schema: EcSchema,
         config: Arc<Configuration>,
         handle: Handle,
+        datanode_connection_cache: Arc<DatanodeConnectionCache>,
         crypto: Option<Arc<FileCryptoCodec>>,
     ) -> Self {
         assert_eq!(block.block_indices().len(), block.locs.len());
@@ -502,6 +696,7 @@ impl StripedBlockStream {
             ec_schema,
             config,
             handle,
+            datanode_connection_cache,
             current_block_start,
             block_end,
             cell_readers: vec![],
@@ -651,6 +846,7 @@ impl StripedBlockStream {
                 len,
                 Arc::clone(&self.config),
                 self.handle.clone(),
+                Arc::clone(&self.datanode_connection_cache),
                 None,
             );
 
@@ -687,5 +883,78 @@ impl StripedBlockStream {
                 buffers.pop_front().map(|b| (Ok(b), (stream, buffers)))
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replica_order;
+    use crate::proto::hdfs::{DatanodeInfoProto, datanode_info_proto::AdminState};
+    use std::time::Duration;
+
+    const NOW: u64 = 1_000_000;
+    const STALE_INTERVAL: Duration = Duration::from_secs(30);
+
+    fn location(rack: &str, heartbeat_age_ms: u64) -> DatanodeInfoProto {
+        DatanodeInfoProto {
+            location: Some(rack.to_string()),
+            last_update: Some(NOW - heartbeat_age_ms),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn replica_rotation_ignores_network_location() {
+        let locations = vec![
+            location("/rack-a", 0),
+            location("/rack-b", 10),
+            location("/rack-c", 20),
+        ];
+        assert_eq!(
+            replica_order(&locations, None, STALE_INTERVAL, false),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            replica_order(&locations, Some(1), STALE_INTERVAL, false),
+            vec![1, 2, 0]
+        );
+        assert_eq!(
+            replica_order(&locations, Some(5), STALE_INTERVAL, false),
+            vec![2, 0, 1]
+        );
+    }
+
+    #[test]
+    fn replica_rotation_keeps_stale_and_maintenance_replicas_as_fallbacks() {
+        let mut maintenance = location("/rack-a", 0);
+        maintenance.admin_state = Some(AdminState::InMaintenance as i32);
+        let locations = vec![
+            location("/rack-a", 30_001),
+            location("/rack-b", 0),
+            maintenance,
+            location("/rack-c", 1),
+        ];
+        assert_eq!(
+            replica_order(&locations, Some(1), STALE_INTERVAL, false),
+            vec![3, 1, 0, 2]
+        );
+    }
+
+    #[test]
+    fn replica_rotation_requires_heartbeat_metadata() {
+        let locations = vec![DatanodeInfoProto::default(), DatanodeInfoProto::default()];
+        assert_eq!(
+            replica_order(&locations, Some(1), STALE_INTERVAL, false),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn replica_rotation_preserves_priority_aware_namenode_order() {
+        let locations = vec![location("/rack-a", 0), location("/rack-b", 0)];
+        assert_eq!(
+            replica_order(&locations, Some(1), STALE_INTERVAL, true),
+            vec![0, 1]
+        );
     }
 }

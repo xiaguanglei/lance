@@ -44,6 +44,7 @@
 //! let client = ClientBuilder::new().with_url("hdfs://localhost:9000").build().unwrap();
 //! ```
 pub mod acl;
+pub(crate) mod block_locations;
 pub mod client;
 pub(crate) mod common;
 #[cfg(feature = "benchmark")]
