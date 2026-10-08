@@ -7,9 +7,8 @@
 //! library (libhdfs) via JNI. It requires `JAVA_HOME` and `HADOOP_HOME`
 //! environment variables to be set.
 //!
-//! Compared to the `HdfsNative` provider (`hdfs` feature), this supports
-//! additional features such as Kerberos authentication, High Availability (HA),
-//! and append operations.
+//! This retains the existing JNI/QBFS integration. Both native and JNI backends
+//! support Kerberos, High Availability (HA), and append operations.
 //!
 //! # Configuration
 //!
@@ -34,11 +33,11 @@ use std::sync::Arc;
 use lance_core::Error;
 use object_store::path::Path;
 use object_store_opendal::OpendalStore;
-use opendal::{services::Hdfs, Operator};
+use opendal::{Operator, services::Hdfs};
 
 use crate::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
-    DEFAULT_CLOUD_IO_PARALLELISM,
+    DEFAULT_CLOUD_IO_PARALLELISM, ObjectStore, ObjectStoreParams, ObjectStoreProvider,
+    StorageOptions,
 };
 
 #[derive(Debug, Clone)]
@@ -51,12 +50,8 @@ impl ObjectStoreProvider for HdfsJniStoreProvider {
         base_path: url::Url,
         params: &ObjectStoreParams,
     ) -> Result<ObjectStore, lance_core::Error> {
-        let mut storage_options = StorageOptions(
-                            params
-                                .storage_options()
-                                .cloned()
-                                .unwrap_or_default(),
-                        );
+        let mut storage_options =
+            StorageOptions(params.storage_options().cloned().unwrap_or_default());
 
         let download_retry_count = storage_options.download_retry_count();
 
@@ -67,24 +62,23 @@ impl ObjectStoreProvider for HdfsJniStoreProvider {
             );
         }
 
-        let root = base_path.path();
-        if !root.is_empty() && root != "/" && !storage_options.0.contains_key("root") {
-            storage_options.0.insert("root".to_string(), "/".to_string());
+        // Default root to "/" so OpenDAL always knows where to start.
+        // StorageOptions users can override this if needed.
+        if !storage_options.0.contains_key("root") {
+            storage_options
+                .0
+                .insert("root".to_string(), "/".to_string());
         }
 
-        let operator = Operator::from_iter::<Hdfs>(storage_options.0.into_iter())
-            .map_err(|e| {
-                Error::invalid_input(
-                    format!("Failed to create HDFS operator: {:?}", e)
-                )
-            })?
-            .finish();
+        let operator = Operator::from_iter::<Hdfs>(storage_options.0.into_iter()).map_err(|e| {
+            Error::invalid_input(format!("Failed to create HDFS operator: {:?}", e))
+        })?;
 
         let opendal_store = Arc::new(OpendalStore::new(operator));
         Ok(ObjectStore::new(
             opendal_store,
             base_path,
-            params.block_size,
+            params.resolved_block_size()?,
             None,
             params.use_constant_size_upload_parts,
             true,
@@ -95,16 +89,14 @@ impl ObjectStoreProvider for HdfsJniStoreProvider {
     }
 
     fn extract_path(&self, url: &url::Url) -> Result<Path, Error> {
-        if let Ok(file_path) = url.to_file_path() {
-            if let Ok(path) = Path::from_absolute_path(&file_path) {
-                return Ok(path);
-            }
+        if let Ok(file_path) = url.to_file_path()
+            && let Ok(path) = Path::from_absolute_path(&file_path)
+        {
+            return Ok(path);
         }
 
         Path::parse(url.path()).map_err(|e| {
-            Error::invalid_input(
-                format!("Failed to parse path '{}': {}", url.path(), e)
-            )
+            Error::invalid_input(format!("Failed to parse path '{}': {}", url.path(), e))
         })
     }
 }
@@ -160,8 +152,11 @@ mod tests {
             ("root".to_string(), "/".to_string()),
         ];
 
-        let result = Operator::from_iter::<Hdfs>(options.into_iter());
-        assert!(result.is_ok(), "Hdfs operator should be created from valid config");
+        let result = Operator::from_iter::<Hdfs>(options);
+        assert!(
+            result.is_ok(),
+            "Hdfs operator should be created from valid config"
+        );
     }
 
     #[test]

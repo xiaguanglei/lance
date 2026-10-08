@@ -87,12 +87,10 @@ pub(crate) fn initial_upload_size() -> usize {
 /// This implements the `AsyncWrite` trait.
 pub struct ObjectWriter {
     state: UploadState,
-    /// The path being written to (may be a temp path if using safe writes).
     path: Arc<Path>,
-    /// If set, the writer will rename `path` → `final_path` on shutdown.
     final_path: Option<Arc<Path>>,
-    /// The underlying object store, used for the rename operation.
     store: Arc<dyn ObjectStore>,
+    is_published: bool,
     cursor: usize,
     buffer: Vec<u8>,
     // TODO: use constant size to support R2
@@ -118,7 +116,7 @@ pub struct WriteResult {
 #[derive(Debug)]
 struct UploadFailure {
     context: String,
-    /// The kind `into_io_error` restores. Without it every contextualized
+    /// The kind restored when wrapping this failure. Without it every contextualized
     /// failure would collapse to `ErrorKind::Other`, changing what callers
     /// matching on the kind observe.
     kind: io::ErrorKind,
@@ -154,11 +152,6 @@ impl UploadFailure {
             kind: io::ErrorKind::Other,
             source: Box::new(source),
         }
-    }
-
-    fn into_io_error(self) -> io::Error {
-        let kind = self.kind;
-        io::Error::new(kind, self)
     }
 }
 
@@ -222,6 +215,15 @@ enum UploadState {
     PuttingSingle(BoxFuture<'static, UploadResult<WriteResult>>),
     /// The writer is in the process of completing the multipart upload.
     Completing(BoxFuture<'static, UploadResult<WriteResult>>),
+    /// A closed staging object is being atomically moved to its final name.
+    Publishing(BoxFuture<'static, UploadResult<WriteResult>>),
+    /// A completed future must never be polled again after returning an error.
+    Failed {
+        error: Arc<UploadFailure>,
+        upload: Option<Box<dyn MultipartUpload>>,
+    },
+    /// An aborted writer cannot publish or accept more data.
+    Aborted,
     /// The writer has been shut down and all data has been written.
     Done(WriteResult),
 }
@@ -295,27 +297,51 @@ impl UploadState {
 }
 
 impl ObjectWriter {
+    fn fail_upload(&mut self, failure: UploadFailure) -> io::Error {
+        let error = Arc::new(failure);
+        let previous = std::mem::replace(
+            &mut self.state,
+            UploadState::Failed {
+                error: error.clone(),
+                upload: None,
+            },
+        );
+        if let UploadState::InProgress { upload, .. } = previous {
+            // Keep ownership for explicit abort/Drop. Dropping the JoinSet
+            // cancels remaining parts; the failed part cannot be forgotten.
+            self.state = UploadState::Failed {
+                error: error.clone(),
+                upload: Some(upload),
+            };
+        }
+        io::Error::new(error.kind, error)
+    }
+
     pub async fn new(object_store: &LanceObjectStore, path: &Path) -> Result<Self> {
         Self::new_with_options(object_store, path, None).await
     }
 
-    /// Creates a new ObjectWriter that writes to `path`.
+    /// Write to a private staging path and publish it only after shutdown.
     ///
-    /// If `final_path` is provided, the writer will write all data to `path`
-    /// (the temp path), and on `shutdown()` it will rename `path` → `final_path`.
-    /// This provides atomic writes for storage backends (e.g., HDFS/QBFS) where
-    /// `close()` may return before data is fully flushed.
+    /// When `final_path` is present it must differ from `path`. Publication is
+    /// part of `AsyncWrite::shutdown`, so neither trait can expose a partial file.
     pub async fn new_with_options(
         object_store: &LanceObjectStore,
         path: &Path,
         final_path: Option<&Path>,
     ) -> Result<Self> {
+        if final_path == Some(path) {
+            return Err(Error::invalid_input(
+                "staging and final object paths must differ",
+            ));
+        }
         Ok(Self {
             state: UploadState::Started(object_store.inner.clone()),
             cursor: 0,
             path: Arc::new(path.clone()),
-            final_path: final_path.map(|p| Arc::new(p.clone())),
+            final_path: final_path.map(|path| Arc::new(path.clone())),
             store: object_store.inner.clone(),
+            is_published: false,
             buffer: Vec::with_capacity(initial_upload_size()),
             use_constant_size_upload_parts: object_store.use_constant_size_upload_parts,
         })
@@ -377,6 +403,15 @@ impl ObjectWriter {
         loop {
             match &mut mut_self.state {
                 UploadState::Started(_) | UploadState::Done(_) => break,
+                UploadState::Failed { error, .. } => {
+                    return Err(io::Error::new(error.kind, error.clone()));
+                }
+                UploadState::Aborted => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "writer was aborted",
+                    ));
+                }
                 UploadState::CreatingUpload(fut) => match fut.poll_unpin(cx) {
                     Poll::Ready(Ok(mut upload)) => {
                         let mut futures = JoinSet::new();
@@ -406,7 +441,9 @@ impl ObjectWriter {
                             upload,
                         };
                     }
-                    Poll::Ready(Err(err)) => return Err(err.into_io_error()),
+                    Poll::Ready(Err(err)) => {
+                        return Err(mut_self.fail_upload(err));
+                    }
                     Poll::Pending => break,
                 },
                 UploadState::InProgress { futures, .. } => {
@@ -414,16 +451,16 @@ impl ObjectWriter {
                         match res {
                             Ok(Ok(())) => {}
                             Err(err) => {
-                                return Err(UploadFailure::from_task(
+                                let failure = UploadFailure::from_task(
                                     format!(
                                         "multipart upload task for {} did not complete",
                                         mut_self.path
                                     ),
                                     err,
-                                )
-                                .into_io_error());
+                                );
+                                return Err(mut_self.fail_upload(failure));
                             }
-                            Ok(Err(err)) => return Err(err.into_io_error()),
+                            Ok(Err(err)) => return Err(mut_self.fail_upload(err)),
                         }
                     }
                     break;
@@ -434,35 +471,92 @@ impl ObjectWriter {
                             res.size = mut_self.cursor;
                             mut_self.state = UploadState::Done(res)
                         }
-                        Poll::Ready(Err(err)) => return Err(err.into_io_error()),
+                        Poll::Ready(Err(err)) => {
+                            return Err(mut_self.fail_upload(err));
+                        }
                         Poll::Pending => break,
                     }
                 }
+                UploadState::Publishing(fut) => match fut.poll_unpin(cx) {
+                    Poll::Ready(Ok(result)) => {
+                        mut_self.is_published = true;
+                        mut_self.state = UploadState::Done(result);
+                    }
+                    Poll::Ready(Err(error)) => {
+                        return Err(mut_self.fail_upload(error));
+                    }
+                    Poll::Pending => break,
+                },
             }
         }
         Ok(())
     }
 
     pub async fn abort(&mut self) {
-        let state = std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
-        if let UploadState::InProgress { mut upload, .. } = state {
+        let state = std::mem::replace(&mut self.state, UploadState::Aborted);
+        if let UploadState::InProgress { mut upload, .. }
+        | UploadState::Failed {
+            upload: Some(mut upload),
+            ..
+        } = state
+        {
             let _ = upload.abort().await;
         }
+        if self.final_path.is_some() && !self.is_published {
+            if let Err(error) = self.store.delete(&self.path).await {
+                if !matches!(error, object_store::Error::NotFound { .. }) {
+                    log::warn!(
+                        "Failed to clean aborted HDFS staging object {}: {}",
+                        self.path,
+                        error
+                    );
+                }
+            }
+        }
+        // Aborted writers must not start publication if shutdown is called later.
+        self.final_path = None;
+        self.buffer.clear();
     }
 }
 
 impl Drop for ObjectWriter {
     fn drop(&mut self) {
         // If there is a multipart upload started but not finished, we should abort it.
-        if matches!(self.state, UploadState::InProgress { .. }) {
+        if matches!(
+            self.state,
+            UploadState::InProgress { .. }
+                | UploadState::Failed {
+                    upload: Some(_),
+                    ..
+                }
+        ) {
             // Take ownership of the state.
             let state =
                 std::mem::replace(&mut self.state, UploadState::Done(WriteResult::default()));
-            if let UploadState::InProgress { mut upload, .. } = state
+            if let UploadState::InProgress { mut upload, .. }
+            | UploadState::Failed {
+                upload: Some(mut upload),
+                ..
+            } = state
                 && let Ok(handle) = Handle::try_current()
             {
                 handle.spawn(async move {
                     let _ = upload.abort().await;
+                });
+            }
+        }
+        if self.final_path.is_some() && !self.is_published {
+            let store = self.store.clone();
+            let path = self.path.clone();
+            if let Ok(handle) = Handle::try_current() {
+                handle.spawn(async move {
+                    if let Err(error) = store.delete(&path).await {
+                        if !matches!(error, object_store::Error::NotFound { .. }) {
+                            log::warn!(
+                                "Failed to clean abandoned HDFS staging object {path}: {error}"
+                            );
+                        }
+                    }
                 });
             }
         }
@@ -476,6 +570,22 @@ impl AsyncWrite for ObjectWriter {
         buf: &[u8],
     ) -> std::task::Poll<std::result::Result<usize, std::io::Error>> {
         self.as_mut().poll_tasks(cx)?;
+
+        if matches!(
+            self.state,
+            UploadState::PuttingSingle(_)
+                | UploadState::Completing(_)
+                | UploadState::Publishing(_)
+                | UploadState::Done(_)
+        ) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "writer is shutting down or already closed",
+            )));
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
 
         // Fill buffer up to remaining capacity.
         let remaining_capacity = self.buffer.capacity() - self.buffer.len();
@@ -559,6 +669,10 @@ impl AsyncWrite for ObjectWriter {
             UploadState::CreatingUpload(_)
             | UploadState::Completing(_)
             | UploadState::PuttingSingle(_) => Poll::Pending,
+            UploadState::Publishing(_) => Poll::Pending,
+            UploadState::Failed { .. } | UploadState::Aborted => {
+                unreachable!("poll_tasks returns the terminal error")
+            }
             // In-flight parts are spawned tasks, so the runtime drives them
             // whether or not this writer is polled again; `poll_tasks` above
             // only reaps them. Waiting for them here would serialize every part
@@ -583,10 +697,31 @@ impl AsyncWrite for ObjectWriter {
             // through a Pin.
             let mut_self = &mut *self;
             match &mut mut_self.state {
-                UploadState::Done(_) => return Poll::Ready(Ok(())),
+                UploadState::Done(result) => {
+                    if mut_self.is_published {
+                        return Poll::Ready(Ok(()));
+                    }
+                    let Some(final_path) = mut_self.final_path.as_ref().cloned() else {
+                        return Poll::Ready(Ok(()));
+                    };
+                    let result = result.clone();
+                    let store = mut_self.store.clone();
+                    let staging = mut_self.path.clone();
+                    mut_self.state = UploadState::Publishing(Box::pin(async move {
+                        store.rename(&staging, &final_path).await.map_err(|error| {
+                            UploadFailure::new(format!("failed to publish closed staging object {staging} to {final_path}"), error)
+                        })?;
+                        Ok(result)
+                    }));
+                    continue;
+                }
                 UploadState::CreatingUpload(_)
                 | UploadState::PuttingSingle(_)
                 | UploadState::Completing(_) => return Poll::Pending,
+                UploadState::Publishing(_) => return Poll::Pending,
+                UploadState::Failed { .. } | UploadState::Aborted => {
+                    unreachable!("poll_tasks returns the terminal error")
+                }
                 UploadState::Started(_) => {
                     // If we didn't start a multipart upload, we can just do a single put.
                     let part = std::mem::take(&mut mut_self.buffer);
@@ -646,30 +781,11 @@ impl Writer for ObjectWriter {
         // failure from this writer already names the path, and stringifying it
         // would flatten the object store error out of the source chain.
         AsyncWriteExt::shutdown(self).await?;
-        let result = if let UploadState::Done(result) = &self.state {
-            result.clone()
+        if let UploadState::Done(result) = &self.state {
+            Ok(result.clone())
         } else {
             unreachable!()
-        };
-
-        // If we wrote to a temp path, atomically rename to the final path.
-        // This ensures that even if the underlying storage (e.g., HDFS/QBFS)
-        // returns from close() before fully flushing data to durable storage,
-        // readers won't see a truncated file: they either see nothing at the
-        // final path (before rename) or the complete file (after rename).
-        if let Some(final_path) = &self.final_path {
-            self.store
-                .rename(&self.path, final_path)
-                .await
-                .map_err(|e| {
-                    Error::io(format!(
-                        "failed to rename temp file {} to final path {} after shutdown: {}",
-                        self.path, final_path, e
-                    ))
-                })?;
         }
-
-        Ok(result)
     }
 }
 
@@ -1254,8 +1370,8 @@ mod tests {
         let unwrapped = io::Error::from(not_found());
         assert_eq!(unwrapped.kind(), io::ErrorKind::NotFound);
 
-        let wrapped =
-            UploadFailure::new("part upload failed".to_string(), not_found()).into_io_error();
+        let failure = UploadFailure::new("part upload failed".to_string(), not_found());
+        let wrapped = io::Error::new(failure.kind, failure);
         assert_eq!(wrapped.kind(), unwrapped.kind());
     }
 

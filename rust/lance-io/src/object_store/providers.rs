@@ -95,44 +95,54 @@ pub struct ObjectStoreRegistryStats {
     pub active_stores: usize,
 }
 
-
-/// Dynamic HDFS provider.
+/// Whether the registered HDFS provider uses the Rust backend.
 ///
-/// When both `hdfs` and `hdfs-jni` features are enabled, this provider selects
-/// the backend at runtime. It defaults to the pure-Rust implementation
-/// (hdfs-native) but switches to the JNI-based implementation (libhdfs/Java)
-/// when `storage_options` contains `"hdfs_backend" = "jni"`.
+/// Manifest publication must use the same backend decision as ordinary IO.
+pub fn uses_hdfs_native_backend(params: Option<&ObjectStoreParams>) -> bool {
+    uses_hdfs_native_backend_with_options(params.and_then(ObjectStoreParams::storage_options))
+}
+
+pub(crate) fn uses_hdfs_native_backend_with_options(
+    options: Option<&HashMap<String, String>>,
+) -> bool {
+    #[cfg(feature = "hdfs")]
+    {
+        #[cfg(not(feature = "hdfs-jni"))]
+        let _ = options;
+        #[cfg(feature = "hdfs-jni")]
+        if options
+            .and_then(|options| options.get("hdfs_backend"))
+            .is_some_and(|backend| backend.eq_ignore_ascii_case("jni"))
+        {
+            return false;
+        }
+        true
+    }
+    #[cfg(not(feature = "hdfs"))]
+    {
+        let _ = options;
+        false
+    }
+}
+
 #[cfg(all(feature = "hdfs", feature = "hdfs-jni"))]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct HdfsDynamicStoreProvider;
 
 #[cfg(all(feature = "hdfs", feature = "hdfs-jni"))]
 #[async_trait::async_trait]
 impl ObjectStoreProvider for HdfsDynamicStoreProvider {
-    async fn new_store(
-        &self,
-        base_path: Url,
-        params: &ObjectStoreParams,
-    ) -> Result<ObjectStore> {
-        let use_jni = params
-            .storage_options()
-            .and_then(|opts| opts.get("hdfs_backend"))
-            .map(|v| v.eq_ignore_ascii_case("jni"))
-            .unwrap_or(false);
-
-        if use_jni {
-            hdfs_jni::HdfsJniStoreProvider
-                .new_store(base_path, params)
-                .await
+    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+        if uses_hdfs_native_backend(Some(params)) {
+            hdfs::HdfsStoreProvider.new_store(base_path, params).await
         } else {
-            hdfs::HdfsStoreProvider
+            hdfs_jni::HdfsJniStoreProvider
                 .new_store(base_path, params)
                 .await
         }
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {
-        // Both backends use the same path extraction logic.
         hdfs::HdfsStoreProvider.extract_path(url)
     }
 }
@@ -449,21 +459,12 @@ impl Default for ObjectStoreRegistry {
         providers.insert("hf".into(), Arc::new(huggingface::HuggingfaceStoreProvider));
         #[cfg(feature = "tos")]
         providers.insert("tos".into(), Arc::new(tos::TosStoreProvider));
-        // hdfs:// scheme: when both `hdfs` (pure Rust) and `hdfs-jni` (JNI) are
-        // enabled, a dynamic provider selects at runtime based on
-        // `storage_options["hdfs_backend"]`. Default is pure Rust; set
-        // `hdfs_backend = "jni"` to use the JNI backend.
         #[cfg(all(feature = "hdfs", feature = "hdfs-jni"))]
-        providers.insert(
-            "hdfs".into(),
-            Arc::new(HdfsDynamicStoreProvider),
-        );
+        providers.insert("hdfs".into(), Arc::new(HdfsDynamicStoreProvider));
         #[cfg(all(feature = "hdfs", not(feature = "hdfs-jni")))]
         providers.insert("hdfs".into(), Arc::new(hdfs::HdfsStoreProvider));
         #[cfg(all(feature = "hdfs-jni", not(feature = "hdfs")))]
         providers.insert("hdfs".into(), Arc::new(hdfs_jni::HdfsJniStoreProvider));
-
-        // qbfs:// scheme: always uses JNI backend (separate scheme, no conflicts)
         #[cfg(feature = "qbfs")]
         providers.insert("qbfs".into(), Arc::new(hdfs_jni::HdfsJniStoreProvider));
         Self {

@@ -219,6 +219,10 @@ pub struct ObjectStore {
     download_retry_count: usize,
     /// IO tracker for monitoring read/write operations
     io_tracker: IOTracker,
+    #[cfg(feature = "hdfs")]
+    range_reader_factory: Option<Arc<dyn CloudRangeReaderFactory>>,
+    /// Backend selection, retained even if a wrapper disables direct reads.
+    hdfs_native_backend: bool,
     /// The datastore prefix that uniquely identifies this object store. It encodes information
     /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
     /// path uniquely identifies any object inside the store.
@@ -226,6 +230,16 @@ pub struct ObjectStore {
     /// The backend's paginated listing API, when it has one. `None` means
     /// [`Self::read_dir_page`] has to list a directory in full to page through it.
     pub(crate) paginated_lister: Option<Arc<dyn PaginatedListStore>>,
+}
+
+#[cfg(feature = "hdfs")]
+#[async_trait]
+pub(crate) trait CloudRangeReaderFactory: std::fmt::Debug + Send + Sync {
+    async fn open(
+        &self,
+        path: Path,
+        tracker: IOTracker,
+    ) -> object_store::Result<Arc<dyn crate::object_reader::CloudRangeReader>>;
 }
 
 // Hand-written because `PaginatedListStore` is not `Debug`.
@@ -692,6 +706,9 @@ impl ObjectStore {
                 io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
+                #[cfg(feature = "hdfs")]
+                range_reader_factory: None,
+                hdfs_native_backend: false,
                 store_prefix,
                 // Type-erased on the way in, so there is no telling if it can paginate.
                 paginated_lister: None,
@@ -770,27 +787,47 @@ impl ObjectStore {
         self.scheme == "file" || self.scheme == "file+uring"
     }
 
+    /// HDFS writers must publish only after closing a private staging file.
+    /// The legacy QBFS escape hatch remains opt-in; it disables this safety
+    /// barrier and must not be enabled in the Rust gateway's default path.
+    pub fn needs_safe_write(&self) -> bool {
+        if std::env::var_os("LANCE_DISABLE_SAFE_WRITE").is_some() {
+            return false;
+        }
+        matches!(self.scheme.as_str(), "hdfs" | "hdfs-jni" | "qbfs")
+    }
+
+    /// Generate an owned staging name beside the final file, preserving the
+    /// internal 8.0 helper and directory ACL inheritance.
+    pub fn make_temp_write_path(&self, final_path: &Path) -> Result<Path> {
+        let suffix: u64 = rand::random();
+        let filename = final_path.filename().unwrap_or("tmp");
+        let staging = format!(".tmp_{}_{:016x}", filename, suffix);
+        // These are already encoded Path components. Parsing preserves their
+        // representation; From<String> would encode '%' again and change the
+        // parent directory for paths containing escaped characters.
+        let raw = match final_path.as_ref().rfind('/') {
+            Some(offset) => format!("{}/{}", &final_path.as_ref()[..offset], staging),
+            None => staging,
+        };
+        Ok(Path::parse(raw)?)
+    }
+
+    #[cfg(feature = "hdfs")]
+    pub(crate) fn with_range_reader_factory(
+        mut self,
+        factory: Arc<dyn CloudRangeReaderFactory>,
+    ) -> Self {
+        self.range_reader_factory = Some(factory);
+        self
+    }
+
     /// Returns true when object paths directly encode absolute local filesystem paths.
     ///
     /// Local stores rooted below the filesystem root, such as UNC-backed stores, use
     /// their inner object-store implementation instead of direct filesystem access.
     pub fn has_direct_local_paths(&self) -> bool {
         self.is_local() && self.store_prefix == self.scheme
-    }
-
-    /// Returns true if this storage backend requires safe (temp-then-rename)
-    /// writes to avoid truncation from async close() semantics.
-    ///
-    /// HDFS and QBFS backends may return from `close()` before data is fully
-    /// flushed to durable storage. Writing to a temp path then atomically
-    /// renaming prevents readers from seeing truncated files.
-    pub fn needs_safe_write(&self) -> bool {
-        // Escape hatch when the backend cannot rename/copy (e.g. some QBFS builds).
-        // Set LANCE_DISABLE_SAFE_WRITE=1 to write directly to the final path.
-        if std::env::var_os("LANCE_DISABLE_SAFE_WRITE").is_some() {
-            return false;
-        }
-        matches!(self.scheme.as_str(), "hdfs" | "hdfs-jni" | "qbfs")
     }
 
     pub fn is_cloud(&self) -> bool {
@@ -864,6 +901,11 @@ impl ObjectStore {
     /// [`WrappingObjectStore::wrap_paginated`] clears the lister so that
     /// [`Self::read_dir_page`] falls back through the (already-wrapped) `inner`.
     pub fn apply_wrapper(&mut self, wrapper: &dyn WrappingObjectStore) {
+        // A backend shortcut must never bypass a newly installed wrapper.
+        #[cfg(feature = "hdfs")]
+        {
+            self.range_reader_factory = None;
+        }
         self.inner = wrapper.wrap(&self.store_prefix, self.inner.clone());
         self.paginated_lister = self
             .paginated_lister
@@ -911,16 +953,7 @@ impl ObjectStore {
                     .await
                 }
             }
-            _ => Ok(Box::new(
-                CloudObjectReader::new(
-                    self.inner.clone(),
-                    path.clone(),
-                    self.block_size,
-                    None,
-                    self.download_retry_count,
-                )?
-                .with_io_parallelism(self.io_parallelism()),
-            )),
+            _ => self.open_cloud_reader(path, None).await,
         }
     }
 
@@ -976,17 +1009,31 @@ impl ObjectStore {
                     .await
                 }
             }
-            _ => Ok(Box::new(
-                CloudObjectReader::new(
-                    self.inner.clone(),
-                    path.clone(),
-                    self.block_size,
-                    Some(known_size),
-                    self.download_retry_count,
-                )?
-                .with_io_parallelism(self.io_parallelism()),
-            )),
+            _ => self.open_cloud_reader(path, Some(known_size)).await,
         }
+    }
+
+    async fn open_cloud_reader(
+        &self,
+        path: &Path,
+        known_size: Option<usize>,
+    ) -> Result<Box<dyn Reader>> {
+        let reader = CloudObjectReader::new(
+            self.inner.clone(),
+            path.clone(),
+            self.block_size,
+            known_size,
+            self.download_retry_count,
+        )?
+        .with_io_parallelism(self.io_parallelism());
+        #[cfg(feature = "hdfs")]
+        let reader = match &self.range_reader_factory {
+            Some(factory) => {
+                reader.with_range_reader(factory.open(path.clone(), self.io_tracker.clone()).await?)
+            }
+            None => reader,
+        };
+        Ok(Box::new(reader))
     }
 
     /// Create an [ObjectWriter] from local [std::path::Path]
@@ -1040,34 +1087,13 @@ impl ObjectStore {
                     Arc::new(self.io_tracker.clone()),
                 )))
             }
-            _ => {
-                if self.needs_safe_write() {
-                    // HDFS/QBFS: write to temp path then atomically rename.
-                    // This prevents readers from seeing truncated files when
-                    // HDFS close() returns before block finalization.
-                    let temp_path = self.make_temp_write_path(path)?;
-                    Ok(Box::new(
-                        ObjectWriter::new_with_options(self, &temp_path, Some(path)).await?,
-                    ))
-                } else {
-                    Ok(Box::new(ObjectWriter::new(self, path).await?))
-                }
+            _ if self.needs_safe_write() => {
+                let staging = self.make_temp_write_path(path)?;
+                Ok(Box::new(
+                    ObjectWriter::new_with_options(self, &staging, Some(path)).await?,
+                ))
             }
-        }
-    }
-
-    /// Generate a unique temp path for safe writes.
-    pub fn make_temp_write_path(&self, final_path: &Path) -> Result<Path> {
-        let suffix: u64 = rand::random();
-        let filename = final_path.filename().unwrap_or("tmp");
-        let temp_filename = format!(".tmp_{}_{:016x}", filename, suffix);
-        let final_str = final_path.as_ref();
-        // Insert the temp prefix before the filename component
-        if let Some(last_slash) = final_str.rfind('/') {
-            let parent = &final_str[..last_slash];
-            Ok(Path::from(format!("{}/{}", parent, temp_filename)))
-        } else {
-            Ok(Path::from(temp_filename))
+            _ => Ok(Box::new(ObjectWriter::new(self, path).await?)),
         }
     }
 
@@ -1099,9 +1125,9 @@ impl ObjectStore {
             });
         }
 
-        if self.is_local() {
+        if self.is_local() || self.hdfs_native_backend {
             let staging_path =
-                Path::from(format!("{}.tmp.{}", path, uuid::Uuid::new_v4().simple()));
+                Path::parse(format!("{}.tmp.{}", path, uuid::Uuid::new_v4().simple()))?;
             self.inner.put(&staging_path, content).await?;
             let result = self.inner.rename_if_not_exists(&staging_path, path).await;
             if result.is_err()
@@ -1910,6 +1936,10 @@ impl ObjectStore {
             io_parallelism,
             download_retry_count,
             io_tracker,
+            #[cfg(feature = "hdfs")]
+            range_reader_factory: None,
+            hdfs_native_backend: scheme == "hdfs"
+                && providers::uses_hdfs_native_backend_with_options(storage_options),
             store_prefix,
             // Type-erased on the way in, so there is no telling if it can paginate.
             paginated_lister: None,

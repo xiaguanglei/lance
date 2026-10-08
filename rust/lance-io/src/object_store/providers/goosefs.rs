@@ -491,6 +491,9 @@ impl ObjectStoreProvider for GooseFsStoreProvider {
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
             list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(false),
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+            hdfs_native_backend: false,
+            #[cfg(feature = "hdfs")]
+            range_reader_factory: None,
             download_retry_count: storage_options.download_retry_count(),
             io_tracker: Default::default(),
             store_prefix: self

@@ -29,6 +29,12 @@ use crate::{
     traits::{ByteStream, Reader},
 };
 
+#[cfg(feature = "hdfs")]
+pub(crate) trait CloudRangeReader: std::fmt::Debug + Send + Sync {
+    fn size(&self) -> usize;
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>>;
+}
+
 trait StaticGetRange {
     fn path(&self) -> &Path;
     fn get_range(&self) -> BoxFuture<'static, OSResult<GetResult>>;
@@ -69,6 +75,8 @@ pub struct CloudObjectReader {
     pub path: Path,
     // File size, if known.
     size: OnceCell<usize>,
+    #[cfg(feature = "hdfs")]
+    range_reader: Option<Arc<dyn CloudRangeReader>>,
 
     block_size: usize,
     io_parallelism: usize,
@@ -95,6 +103,8 @@ impl CloudObjectReader {
             object_store,
             path,
             size: OnceCell::new_with(known_size),
+            #[cfg(feature = "hdfs")]
+            range_reader: None,
             block_size,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
@@ -109,6 +119,12 @@ impl CloudObjectReader {
     /// configured request limit instead of the hardcoded cloud default.
     pub fn with_io_parallelism(mut self, io_parallelism: usize) -> Self {
         self.io_parallelism = io_parallelism;
+        self
+    }
+
+    #[cfg(feature = "hdfs")]
+    pub(crate) fn with_range_reader(mut self, reader: Arc<dyn CloudRangeReader>) -> Self {
+        self.range_reader = Some(reader);
         self
     }
 }
@@ -188,6 +204,10 @@ impl Reader for CloudObjectReader {
 
     /// Object/File Size.
     fn size(&self) -> BoxFuture<'_, object_store::Result<usize>> {
+        #[cfg(feature = "hdfs")]
+        if let Some(reader) = &self.range_reader {
+            return Box::pin(async move { Ok(reader.size()) });
+        }
         Box::pin(async move {
             self.size
                 .get_or_try_init(|| async move {
@@ -202,6 +222,13 @@ impl Reader for CloudObjectReader {
 
     #[instrument(level = "debug", skip(self))]
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, OSResult<Bytes>> {
+        #[cfg(feature = "hdfs")]
+        if let Some(reader) = &self.range_reader {
+            let reader = Arc::clone(reader);
+            return Box::pin(async move {
+                do_with_retry(move || reader.get_range(range.clone())).await
+            });
+        }
         let object_store = self.object_store.clone();
         let path = self.path.clone();
         let range = Range {

@@ -260,6 +260,9 @@ impl ObjectStoreProvider for AwsStoreProvider {
             use_constant_size_upload_parts,
             list_is_lexically_ordered: !is_s3_express,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+            hdfs_native_backend: false,
+            #[cfg(feature = "hdfs")]
+            range_reader_factory: None,
             download_retry_count,
             io_tracker: Default::default(),
             store_prefix: self

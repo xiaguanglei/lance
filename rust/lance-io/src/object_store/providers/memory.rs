@@ -30,6 +30,9 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             use_constant_size_upload_parts: false,
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+            hdfs_native_backend: false,
+            #[cfg(feature = "hdfs")]
+            range_reader_factory: None,
             download_retry_count,
             io_tracker: Default::default(),
             store_prefix: self
