@@ -1,0 +1,4 @@
+# Independent vendor builds are validated locally, not shipped with the source.
+target/
+Cargo.lock
+.cargo_vcs_info.json

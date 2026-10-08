@@ -4,3 +4,5 @@ Cargo.lock linguist-generated
 rust/lance-file/test_data/**/*.lance binary
 # Keep the vendored upstream protocol sources byte-for-byte unchanged.
 thirdparty/hdfs-native/src/proto/** whitespace=-blank-at-eol,-blank-at-eof
+# Preserve empty trailing columns in the upstream dependency matrix.
+thirdparty/object_store_opendal-0.60.2/DEPENDENCIES.rust.tsv whitespace=-blank-at-eol

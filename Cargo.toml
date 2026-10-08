@@ -27,7 +27,14 @@ members = [
     "rust/arrow-scalar",
     "rust/arrow-stats",
 ]
-exclude = ["python", "java/lance-jni"]
+exclude = [
+    "python",
+    "java/lance-jni",
+    "thirdparty/hdfs-native",
+    "thirdparty/object_store_opendal-0.60.2",
+    "thirdparty/opendal-service-hdfs-0.59.2",
+    "thirdparty/opendal-service-hdfs-native-0.59.2",
+]
 # Python package needs to be built by maturin.
 resolver = "3"
 
@@ -177,8 +184,13 @@ moka = { version = "0.12", features = ["future", "sync"] }
 ndarray = { version = "0.16.1", features = ["matrixmultiply-threading"] }
 num-traits = "0.2"
 object_store = { version = "0.14.1" }
-opendal = { version = "0.59.2" }
-object_store_opendal = { version = "0.60.2" }
+# Pin patched packages so a fresh consumer lock cannot select an unpatched
+# compatible registry release ahead of the local [patch.crates-io] entry.
+opendal = { version = "=0.59.2" }
+object_store_opendal = { version = "=0.60.2" }
+hdfs-native = "=0.14.5"
+opendal-service-hdfs-native = { version = "=0.59.2" }
+opendal-service-hdfs = { version = "=0.59.2" }
 # Pin 0.2.2 so Cargo unifies past OpenDAL 0.59.2's `^0.2.1` req. 0.2.2 keeps
 # `metadata_cache_enabled` off until GOOSEFS_METADATA_CACHE_ENABLED=true.
 goosefs-sdk = { version = "0.2.2", default-features = false }
@@ -284,8 +296,10 @@ single_range_in_vec_init = "allow"
 large_futures = "deny"
 disallowed_macros = "deny"
 
-# Local patch: restore native rename (object_store_opendal 0.55 behavior) on 0.57.
-# Pure downgrade to 0.55 also requires object_store 0.12 + opendal 0.55 and is incompatible
-# with current lance APIs.
+# Preserve the internal atomic publication and authenticated HDFS reader fixes.
+# The adapters are based on the versions required by this community release.
 [patch.crates-io]
-object_store_opendal = { path = "thirdparty/object_store_opendal" }
+hdfs-native = { path = "thirdparty/hdfs-native" }
+object_store_opendal = { path = "thirdparty/object_store_opendal-0.60.2" }
+opendal-service-hdfs = { path = "thirdparty/opendal-service-hdfs-0.59.2" }
+opendal-service-hdfs-native = { path = "thirdparty/opendal-service-hdfs-native-0.59.2" }

@@ -19,17 +19,14 @@ description = "JNI bindings for Lance Columnar format"
 crate-type = ["cdylib"]
 
 [features]
-default = ["lance-io-aws","lance-io-azure","lance-io-gcp","hdfs-jni","qbfs"]
+default = ["lance-io-aws", "lance-io-azure", "lance-io-gcp", "hdfs-jni", "qbfs"]
 backtrace = ["lance/backtrace", "lance-core/backtrace"]
-
-# Forward object-store provider features to `lance-io`.
 lance-io-aws = ["lance-io/aws"]
 lance-io-azure = ["lance-io/azure"]
 lance-io-gcp = ["lance-io/gcp"]
 hdfs = ["lance-io/hdfs"]
 hdfs-jni = ["lance-io/hdfs-jni"]
 qbfs = ["lance-io/qbfs"]
-
 
 [dependencies]
 lance = { path = "../../rust/lance", features = ["substrait", "metrics"] }
@@ -89,6 +86,9 @@ strip = true
 [lints.clippy]
 disallowed_macros = "deny"
 
-# Same native-rename patch as root workspace (QBFS safe-write).
+# The JVM/Spark binding retains JNI and QBFS; the Rust gateway stays native-only.
 [patch.crates-io]
-object_store_opendal = { path = "../../thirdparty/object_store_opendal" }
+hdfs-native = { path = "../../thirdparty/hdfs-native" }
+object_store_opendal = { path = "../../thirdparty/object_store_opendal-0.60.2" }
+opendal-service-hdfs = { path = "../../thirdparty/opendal-service-hdfs-0.59.2" }
+opendal-service-hdfs-native = { path = "../../thirdparty/opendal-service-hdfs-native-0.59.2" }

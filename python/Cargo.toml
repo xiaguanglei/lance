@@ -90,8 +90,6 @@ default = ["extension-module", "lance-io-aws", "lance-io-azure", "lance-io-gcp",
 datagen = ["lance-datagen"]
 extension-module = ["pyo3/extension-module"]
 fp16kernels = ["lance/fp16kernels"]
-
-# Forward object-store provider features to `lance-io`.
 lance-io-aws = ["lance-io/aws"]
 lance-io-azure = ["lance-io/azure"]
 lance-io-gcp = ["lance-io/gcp"]
@@ -116,6 +114,9 @@ incremental = false
 [lints.clippy]
 disallowed_macros = "deny"
 
-# Same native-rename patch used by the root workspace (see ../Cargo.toml).
+# Standalone binding builds must use the same internal storage patches.
 [patch.crates-io]
-object_store_opendal = { path = "../thirdparty/object_store_opendal" }
+hdfs-native = { path = "../thirdparty/hdfs-native" }
+object_store_opendal = { path = "../thirdparty/object_store_opendal-0.60.2" }
+opendal-service-hdfs = { path = "../thirdparty/opendal-service-hdfs-0.59.2" }
+opendal-service-hdfs-native = { path = "../thirdparty/opendal-service-hdfs-native-0.59.2" }

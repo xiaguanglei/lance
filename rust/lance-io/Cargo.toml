@@ -16,6 +16,9 @@ rust-version.workspace = true
 object_store = { workspace = true }
 opendal = { workspace = true, optional = true }
 object_store_opendal = { workspace = true, optional = true }
+hdfs-native = { workspace = true, optional = true }
+opendal-service-hdfs-native = { workspace = true, optional = true }
+opendal-service-hdfs = { workspace = true, optional = true }
 opendal-service-goosefs = { workspace = true, optional = true }
 goosefs-sdk = { workspace = true, optional = true }
 lance-core.workspace = true
@@ -70,7 +73,11 @@ name = "scheduler"
 harness = false
 
 [features]
-default = ["aws", "azure", "gcp", "hdfs", "hdfs-jni", "qbfs"]
+default = ["aws", "azure", "gcp"]
+hdfs = ["dep:hdfs-native", "dep:opendal", "opendal/services-hdfs-native", "dep:opendal-service-hdfs-native", "dep:object_store_opendal"]
+hdfs-test = ["hdfs", "hdfs-native/integration-test"]
+hdfs-jni = ["dep:opendal", "opendal/services-hdfs", "dep:opendal-service-hdfs", "dep:object_store_opendal"]
+qbfs = ["hdfs-jni"]
 metrics = ["dep:metrics"]
 gcs-test = []
 goosefs-test = []
@@ -100,9 +107,6 @@ tencent = ["dep:opendal", "opendal/services-cos", "dep:object_store_opendal"]
 huggingface = ["dep:opendal", "opendal/services-huggingface", "dep:object_store_opendal"]
 tos = ["dep:opendal", "opendal/services-tos", "dep:object_store_opendal"]
 tos-test = ["tos"]
-hdfs = ["dep:opendal", "opendal/services-hdfs-native", "dep:object_store_opendal"]
-hdfs-jni = ["dep:opendal", "opendal/services-hdfs", "dep:object_store_opendal"]
-qbfs = ["dep:opendal", "opendal/services-hdfs", "dep:object_store_opendal"]
 test-util = []
 
 [lints]
