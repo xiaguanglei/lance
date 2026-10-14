@@ -9,11 +9,14 @@ use crate::{
     Dataset,
     dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids},
     index::{
+        DatasetIndexInternalExt,
         prefilter::DatasetPreFilter,
         scalar_logical::{
-            open_named_scalar_index, open_scalar_index_segments, scalar_index_fragment_bitmap,
+            load_named_scalar_segments, open_named_scalar_index, open_scalar_index_segments,
+            scalar_index_fragment_bitmap,
         },
     },
+    session::index_caches::ScalarSearchResultKey,
 };
 use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{Schema, SchemaRef};
@@ -41,15 +44,15 @@ use lance_datafusion::{
 use lance_index::{
     metrics::MetricsCollector,
     scalar::{
-        SargableQuery, ScalarIndex,
-        expression::{ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch},
+        SargableQuery, ScalarIndex, SearchOptions,
+        expression::{ScalarIndexExpr, ScalarIndexLoader, ScalarIndexSearch, search_index_leaf},
     },
 };
 use lance_select::{
     IndexExprResult, NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrMask,
     RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
 };
-use lance_table::format::Fragment;
+use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 use tracing::{debug_span, instrument};
 
@@ -62,6 +65,16 @@ impl ScalarIndexLoader for Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>> {
         open_named_scalar_index(self, column, index_name, metrics).await
+    }
+
+    async fn search_index(
+        &self,
+        search: &ScalarIndexSearch,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<NullableIndexExprResult> {
+        let segments = load_named_scalar_segments(self, &search.column, &search.index_name).await?;
+        cached_index_search(self, self, &segments, search, options, metrics).await
     }
 
     async fn row_addr_result_to_row_ids(
@@ -104,12 +117,64 @@ impl ScalarIndexLoader for FragmentScopedScalarIndexLoader<'_> {
         .await
     }
 
+    async fn search_index(
+        &self,
+        search: &ScalarIndexSearch,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<NullableIndexExprResult> {
+        let mut segments =
+            load_named_scalar_segments(self.dataset, &search.column, &search.index_name).await?;
+        segments.retain(|index| {
+            index
+                .fragment_bitmap
+                .as_ref()
+                .is_none_or(|coverage| coverage.intersection_len(self.fragments) > 0)
+        });
+        cached_index_search(self.dataset, self, &segments, search, options, metrics).await
+    }
+
     async fn row_addr_result_to_row_ids(
         &self,
         result: NullableIndexExprResult,
     ) -> Result<NullableIndexExprResult> {
         self.dataset.row_addr_result_to_row_ids(result).await
     }
+}
+
+/// Search one index-expression leaf, reusing the session's result for the same
+/// query against the same segments.
+///
+/// Index segments are immutable, so a result stays valid until the segment set,
+/// the fragment-reuse remapping or (for stable row ids) the row-id translation
+/// changes; all three are part of the key. Leaves such as tenant ACL clauses
+/// repeat across queries, and an expression evaluated for planning is reused
+/// by its execution instead of searched twice.
+async fn cached_index_search<L: ScalarIndexLoader>(
+    dataset: &Dataset,
+    loader: &L,
+    segments: &[IndexMetadata],
+    search: &ScalarIndexSearch,
+    options: SearchOptions,
+    metrics: &dyn MetricsCollector,
+) -> Result<NullableIndexExprResult> {
+    let mut segment_ids = segments.iter().map(|index| index.uuid).collect::<Vec<_>>();
+    segment_ids.sort_unstable();
+    let key = ScalarSearchResultKey {
+        segments: segment_ids,
+        frag_reuse: dataset.frag_reuse_index_uuid().await,
+        row_id_version: dataset
+            .manifest
+            .uses_stable_row_ids()
+            .then_some(dataset.manifest.version),
+        track_nulls: options.track_nulls(),
+        query: format!("{:?}", search.query),
+    };
+    let result = dataset
+        .index_cache
+        .get_or_insert_with_key(key, || search_index_leaf(loader, search, options, metrics))
+        .await?;
+    Ok(result.as_ref().clone())
 }
 
 /// Translate an address-domain [`NullableRowAddrMask`] into the row-id domain

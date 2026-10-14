@@ -48,13 +48,13 @@ use arrow_array::{Array, RecordBatch, UInt32Array, builder::BinaryBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use roaring::RoaringBitmap;
 
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, deepsize::DeepSizeOf};
 
 use crate::mask::{NullableRowAddrMask, RowAddrMask, RowSetOps};
 
 /// Result of an index search before NULL rows are dropped. Each endpoint
 /// is a [`NullableRowAddrMask`] carrying SQL three-valued logic info.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, DeepSizeOf)]
 pub struct NullableIndexExprResult {
     /// Rows the index *guarantees* are TRUE.
     pub lower: NullableRowAddrMask,

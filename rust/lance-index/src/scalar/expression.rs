@@ -1454,6 +1454,45 @@ pub trait ScalarIndexLoader: Send + Sync {
     ) -> Result<NullableIndexExprResult> {
         Ok(result)
     }
+
+    /// Answer one leaf of an index expression in the row-id domain.
+    ///
+    /// Loaders backed by a dataset session may reuse an earlier result for the
+    /// same query against the same immutable index segments.
+    async fn search_index(
+        &self,
+        search: &ScalarIndexSearch,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<NullableIndexExprResult> {
+        search_index_leaf(self, search, options, metrics).await
+    }
+}
+
+/// Load the leaf's index and search it, translating address-domain results to
+/// the row-id domain.
+pub async fn search_index_leaf<L: ScalarIndexLoader + ?Sized>(
+    loader: &L,
+    search: &ScalarIndexSearch,
+    options: SearchOptions,
+    metrics: &dyn MetricsCollector,
+) -> Result<NullableIndexExprResult> {
+    let index = loader
+        .load_index(&search.column, &search.index_name, metrics)
+        .await?;
+    let result = search_result_to_nullable(
+        index
+            .search_with_options(search.query.as_ref(), options, metrics)
+            .await?,
+    );
+    if index.results_are_row_addresses() {
+        // Translate address-domain results to the row-id domain before
+        // combining or scanning; otherwise stable-row-id datasets silently
+        // drop matches (issue #7434).
+        loader.row_addr_result_to_row_ids(result).await
+    } else {
+        Ok(result)
+    }
 }
 
 /// This represents a search into a scalar index
@@ -1972,25 +2011,13 @@ impl ScalarIndexExpr {
                 Ok(lhs_result | rhs_result)
             }
             Self::Query(search) => {
-                let index = index_loader
-                    .load_index(&search.column, &search.index_name, metrics)
-                    .await?;
-                let search_result = index
-                    .search_with_options(
-                        search.query.as_ref(),
+                index_loader
+                    .search_index(
+                        search,
                         SearchOptions::default().with_track_nulls(track_nulls),
                         metrics,
                     )
-                    .await?;
-                let result = search_result_to_nullable(search_result);
-                if index.results_are_row_addresses() {
-                    // Translate address-domain results to the row-id domain
-                    // before combining or scanning; otherwise stable-row-id
-                    // datasets silently drop matches (issue #7434).
-                    index_loader.row_addr_result_to_row_ids(result).await
-                } else {
-                    Ok(result)
-                }
+                    .await
             }
         }
     }

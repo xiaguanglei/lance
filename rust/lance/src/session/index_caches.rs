@@ -91,6 +91,69 @@ pub(crate) fn write_index_identity(builder: &mut KeyBuilder, uuid: &Uuid, fri_uu
 
 // Cache key types for type-safe cache access
 
+/// A scalar-index leaf search result, valid for one set of immutable index
+/// segments under one fragment-reuse remapping and row-id translation.
+#[derive(Debug)]
+pub struct ScalarSearchResultKey {
+    pub segments: Vec<Uuid>,
+    pub frag_reuse: Option<Uuid>,
+    /// Dataset version whose row-id sequences translated the result; `None`
+    /// when row addresses are row ids.
+    pub row_id_version: Option<u64>,
+    pub track_nulls: bool,
+    /// Debug rendering of the query; it spells out every operand.
+    pub query: String,
+}
+
+impl CacheKey for ScalarSearchResultKey {
+    type ValueType = lance_select::NullableIndexExprResult;
+
+    fn key(&self) -> Cow<'_, str> {
+        let segments = self
+            .segments
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        Cow::Owned(format!(
+            "scalar_search/{segments}/{:?}/{:?}/{}/{}",
+            self.frag_reuse, self.row_id_version, self.track_nulls, self.query
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "ScalarSearchResult"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.scalar-search-result-key", 1)
+    }
+
+    // Typed fields: this key is built for every index leaf of every filtered query.
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_sequence_len(self.segments.len() as u64);
+        for segment in &self.segments {
+            builder.write_fixed_bytes(segment.as_bytes());
+        }
+        match &self.frag_reuse {
+            Some(uuid) => {
+                builder.write_some();
+                builder.write_fixed_bytes(uuid.as_bytes());
+            }
+            None => builder.write_none(),
+        }
+        match self.row_id_version {
+            Some(version) => {
+                builder.write_some();
+                builder.write_u64(version);
+            }
+            None => builder.write_none(),
+        }
+        builder.write_bool(self.track_nulls);
+        builder.write_str(&self.query);
+    }
+}
+
 #[derive(Debug)]
 pub struct FragReuseIndexKey<'a> {
     pub uuid: &'a Uuid,
