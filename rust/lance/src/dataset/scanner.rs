@@ -81,6 +81,7 @@ use lance_index::scalar::inverted::{
 };
 use lance_index::scalar::minhash_lsh::{MinHashLshIndexParams, MinHashQuery};
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
+use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, DIST_COL, Query};
 use lance_io::stream::RecordBatchStream;
 use lance_linalg::distance::MetricType;
@@ -528,6 +529,28 @@ pub static DEFAULT_FRAGMENT_READAHEAD: LazyLock<Option<usize>> = LazyLock::new(|
         "LANCE_DEFAULT_FRAGMENT_READAHEAD",
         &LEGACY_DEFAULT_FRAGMENT_READAHEAD.to_string(),
     )
+});
+
+const DEFAULT_PREFILTER_EXACT_SEARCH_MAX_ROWS_VALUE: u64 = 4096;
+
+/// IVF probes that score as many prefiltered rows as `nprobes` partitions of an
+/// unfiltered search: `nprobes * total / selected`, at most every partition.
+fn prefilter_scaled_nprobes(nprobes: usize, partitions: usize, selected: u64, total: u64) -> usize {
+    if selected == 0 {
+        return partitions;
+    }
+    let scaled = (nprobes as u128 * total as u128).div_ceil(selected as u128);
+    scaled.clamp(nprobes as u128, partitions.max(nprobes) as u128) as usize
+}
+
+/// Upper bound on the rows a scalar-index prefilter may select for a vector
+/// search on a non-flat IVF index to score all of them exactly instead.
+pub static DEFAULT_PREFILTER_EXACT_SEARCH_MAX_ROWS: LazyLock<u64> = LazyLock::new(|| {
+    parse_env_var(
+        "LANCE_PREFILTER_EXACT_SEARCH_MAX_ROWS",
+        &DEFAULT_PREFILTER_EXACT_SEARCH_MAX_ROWS_VALUE.to_string(),
+    )
+    .unwrap_or(DEFAULT_PREFILTER_EXACT_SEARCH_MAX_ROWS_VALUE)
 });
 
 const DEFAULT_XTR_OVERFETCH_VALUE: u32 = 10;
@@ -6276,6 +6299,50 @@ impl Scanner {
             }
         }
 
+        // A scalar-index prefilter that keeps a fraction `f` of the rows (for example
+        // a per-tenant ACL) leaves `f` of every probed partition to score, so a
+        // bounded IVF probe would score `f` as many rows as an unfiltered search and
+        // lose recall. Flat IVF sub-indices test the prefilter mask before scoring a
+        // row, so probing `1 / f` times as many partitions keeps the scoring cost of
+        // an unfiltered search and its recall; a selective filter then probes every
+        // partition and scores all of its rows exactly. Other sub-indices cannot skip
+        // masked rows cheaply and instead scan a small selection exactly.
+        if let Some((_, index_segments, index_metric)) = &index_and_segments
+            && let Some(selected) = self.prefilter_selected_rows(filter_plan).await?
+        {
+            match self
+                .flat_sub_index_partitions(&q.column, index_segments)
+                .await?
+            {
+                Some(partitions) => {
+                    // Index results include deleted rows, so compare with physical rows.
+                    let total = self
+                        .dataset
+                        .fragments()
+                        .iter()
+                        .map(|fragment| fragment.physical_rows.unwrap_or_default() as u64)
+                        .sum();
+                    let probes =
+                        prefilter_scaled_nprobes(q.minimum_nprobes, partitions, selected, total);
+                    if probes > q.minimum_nprobes
+                        && q.query_parallelism == DEFAULT_QUERY_PARALLELISM
+                    {
+                        // The added partitions each score only their prefiltered rows;
+                        // one sequential top-k heap would serialize them, so spread
+                        // them over the CPU pool and merge the per-partition top-k.
+                        q.query_parallelism = -1;
+                    }
+                    q.minimum_nprobes = q.minimum_nprobes.max(probes);
+                    q.maximum_nprobes = q.maximum_nprobes.map(|max| max.max(probes));
+                }
+                None if selected <= (*DEFAULT_PREFILTER_EXACT_SEARCH_MAX_ROWS).max(q.k as u64) => {
+                    q.metric_type = Some(*index_metric);
+                    index_and_segments = None;
+                }
+                None => {}
+            }
+        }
+
         if let Some((index_name, index_segments, index_metric)) = index_and_segments {
             if self.is_batch_nearest {
                 validate_distance_type_for(index_metric, &element_type)?;
@@ -6395,6 +6462,44 @@ impl Scanner {
             }
             Ok(self.flat_knn(plan, &q)?)
         }
+    }
+
+    /// Rows the scalar-index part of a prefilter may select, when the search
+    /// can adapt its plan to that count.
+    async fn prefilter_selected_rows(&self, filter_plan: &ExprFilterPlan) -> Result<Option<u64>> {
+        if self.fast_search || self.is_batch_nearest || self.index_segments.is_some() {
+            return Ok(None);
+        }
+        let Some(index_query) = filter_plan.index_query.as_ref() else {
+            return Ok(None);
+        };
+        // Execution evaluates the same expression for the prefilter; the session
+        // caches its leaf results, so this second evaluation is not repeated work.
+        let candidates = index_query
+            .evaluate(self.dataset.as_ref(), &NoOpMetricsCollector)
+            .await?;
+        Ok(candidates.upper.max_len())
+    }
+
+    /// The largest partition count across the given IVF segments if every one of
+    /// them uses a flat sub-index, otherwise `None`.
+    async fn flat_sub_index_partitions(
+        &self,
+        column: &str,
+        index_segments: &[IndexMetadata],
+    ) -> Result<Option<usize>> {
+        let mut partitions = 0;
+        for segment in index_segments {
+            let index = self
+                .dataset
+                .open_vector_index(column, &segment.uuid, &NoOpMetricsCollector)
+                .await?;
+            if !matches!(index.sub_index_type().0, SubIndexType::Flat) {
+                return Ok(None);
+            }
+            partitions = partitions.max(index.total_partitions());
+        }
+        Ok(Some(partitions))
     }
 
     /// Whether a batch (multi-query) vector search can use the shared-scan
@@ -8547,6 +8652,19 @@ mod test {
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
     };
+
+    #[test]
+    fn test_prefilter_scaled_nprobes_keeps_unfiltered_scoring_budget() {
+        // Unfiltered: the requested probes.
+        assert_eq!(prefilter_scaled_nprobes(20, 447, 200_000, 200_000), 20);
+        // A 13% prefilter probes 1/0.13 as many partitions.
+        assert_eq!(prefilter_scaled_nprobes(20, 447, 26_000, 200_000), 154);
+        // A selective or empty prefilter probes every partition.
+        assert_eq!(prefilter_scaled_nprobes(20, 447, 170, 200_000), 447);
+        assert_eq!(prefilter_scaled_nprobes(20, 447, 0, 200_000), 447);
+        // Never fewer probes than requested.
+        assert_eq!(prefilter_scaled_nprobes(20, 10, 100, 200_000), 20);
+    }
 
     #[test]
     fn test_fts_query_contract_rejects_invalid_values() {
