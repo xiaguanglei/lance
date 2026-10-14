@@ -18,9 +18,10 @@ use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use chrono::Utc;
 use datafusion::catalog::Session;
+use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{DFSchema, JoinType, NullEquality, exec_datafusion_err};
 use datafusion::functions_aggregate;
-use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
+use datafusion::logical_expr::{Expr, ScalarUDF, Volatility, col, lit};
 use datafusion::physical_expr::PhysicalSortExpr;
 #[allow(deprecated)]
 use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
@@ -835,6 +836,30 @@ pub enum ExprFilter {
     Datafusion(Expr),
 }
 
+/// Parsed, type-checked and simplified SQL filters by schema and text.
+///
+/// Services send the same few predicate shapes over and over (one per caller
+/// for a tenant filter), and preparing a filter costs more than evaluating it
+/// against cached index results.
+static SQL_FILTER_CACHE: LazyLock<moka::sync::Cache<(Arc<ArrowSchema>, String), Expr>> =
+    LazyLock::new(|| moka::sync::Cache::new(4096));
+
+/// Whether preparing `filter` gives the same expression at any time: no
+/// stable or volatile function, variable or placeholder.
+fn is_immutable_filter(filter: &Expr) -> bool {
+    !filter
+        .exists(|expr| {
+            Ok(match expr {
+                Expr::ScalarFunction(function) => {
+                    function.func.signature().volatility != Volatility::Immutable
+                }
+                Expr::ScalarVariable(..) | Expr::Placeholder(_) => true,
+                _ => false,
+            })
+        })
+        .unwrap_or(true)
+}
+
 impl ExprFilter {
     /// Converts the filter to a Datafusion expression
     ///
@@ -850,6 +875,10 @@ impl ExprFilter {
         match self {
             Self::Sql(sql) => {
                 let schema = Arc::new(ArrowSchema::from(full_schema));
+                let key = (schema.clone(), sql.clone());
+                if let Some(optimized) = SQL_FILTER_CACHE.get(&key) {
+                    return Ok(optimized);
+                }
                 let planner = Planner::new(schema.clone());
                 let filter = planner.parse_filter(sql)?;
 
@@ -862,9 +891,15 @@ impl ExprFilter {
                     ));
                 }
 
+                // Optimizing folds stable functions such as `now()` with the current
+                // time, so only filters made of immutable parts may be reused.
+                let reusable = is_immutable_filter(&filter);
                 let optimized = planner.optimize_expr(filter).map_err(|e| {
                     Error::invalid_input(format!("Error optimizing sql filter: {sql} ({e})"))
                 })?;
+                if reusable {
+                    SQL_FILTER_CACHE.insert(key, optimized.clone());
+                }
                 Ok(optimized)
             }
             #[cfg(feature = "substrait")]
@@ -8652,6 +8687,26 @@ mod test {
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, ThrottledStoreWrapper, assert_plan_node_equals,
     };
+
+    #[test]
+    fn test_only_immutable_sql_filters_are_reused() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new(
+                "ts",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+                true,
+            ),
+            ArrowField::new("tags", DataType::new_list(DataType::Utf8, true), true),
+        ]));
+        let planner = Planner::new(schema);
+        let reusable = |sql: &str| is_immutable_filter(&planner.parse_filter(sql).unwrap());
+        assert!(reusable("a > 1 AND (a IN (2, 3) OR a IS NULL)"));
+        assert!(reusable("array_has_any(tags, ['x', 'y'])"));
+        // Preparing a filter folds `now()` with the current time.
+        assert!(!reusable("ts < now()"));
+        assert!(!reusable("a > random()"));
+    }
 
     #[test]
     fn test_prefilter_scaled_nprobes_keeps_unfiltered_scoring_budget() {
