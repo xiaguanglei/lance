@@ -170,14 +170,19 @@ impl NullableIndexExprResult {
     }
 }
 
+// An exact result holds the same mask at both endpoints, so the algebra on
+// exact operands computes that mask once instead of once per endpoint.
 impl std::ops::Not for NullableIndexExprResult {
     type Output = Self;
 
     fn not(self) -> Self {
+        if self.exact {
+            return Self::exact(!self.lower);
+        }
         Self {
             lower: !self.upper,
             upper: !self.lower,
-            exact: self.exact,
+            exact: false,
         }
     }
 }
@@ -186,10 +191,13 @@ impl std::ops::BitAnd<Self> for NullableIndexExprResult {
     type Output = Self;
 
     fn bitand(self, rhs: Self) -> Self {
+        if self.exact && rhs.exact {
+            return Self::exact(self.lower & rhs.lower);
+        }
         Self {
             lower: self.lower & rhs.lower,
             upper: self.upper & rhs.upper,
-            exact: self.exact && rhs.exact,
+            exact: false,
         }
     }
 }
@@ -198,10 +206,13 @@ impl std::ops::BitOr<Self> for NullableIndexExprResult {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self {
+        if self.exact && rhs.exact {
+            return Self::exact(self.lower | rhs.lower);
+        }
         Self {
             lower: self.lower | rhs.lower,
             upper: self.upper | rhs.upper,
-            exact: self.exact && rhs.exact,
+            exact: false,
         }
     }
 }
@@ -325,10 +336,13 @@ impl std::ops::Not for IndexExprResult {
     type Output = Self;
 
     fn not(self) -> Self {
+        if self.exact {
+            return Self::exact(!self.lower);
+        }
         Self {
             lower: !self.upper,
             upper: !self.lower,
-            exact: self.exact,
+            exact: false,
         }
     }
 }
@@ -337,10 +351,13 @@ impl std::ops::BitAnd<Self> for IndexExprResult {
     type Output = Self;
 
     fn bitand(self, rhs: Self) -> Self {
+        if self.exact && rhs.exact {
+            return Self::exact(self.lower & rhs.lower);
+        }
         Self {
             lower: self.lower & rhs.lower,
             upper: self.upper & rhs.upper,
-            exact: self.exact && rhs.exact,
+            exact: false,
         }
     }
 }
@@ -349,10 +366,13 @@ impl std::ops::BitOr<Self> for IndexExprResult {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self {
+        if self.exact && rhs.exact {
+            return Self::exact(self.lower | rhs.lower);
+        }
         Self {
             lower: self.lower | rhs.lower,
             upper: self.upper | rhs.upper,
-            exact: self.exact && rhs.exact,
+            exact: false,
         }
     }
 }
