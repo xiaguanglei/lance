@@ -535,12 +535,14 @@ pub static DEFAULT_FRAGMENT_READAHEAD: LazyLock<Option<usize>> = LazyLock::new(|
 const DEFAULT_PREFILTER_EXACT_SEARCH_MAX_ROWS_VALUE: u64 = 4096;
 
 /// IVF probes that score as many prefiltered rows as `nprobes` partitions of an
-/// unfiltered search: `nprobes * total / selected`, at most every partition.
+/// unfiltered search: `nprobes * total / selected` rounded to the nearest count
+/// (a barely selective filter keeps `nprobes`), at most every partition.
 fn prefilter_scaled_nprobes(nprobes: usize, partitions: usize, selected: u64, total: u64) -> usize {
     if selected == 0 {
         return partitions;
     }
-    let scaled = (nprobes as u128 * total as u128).div_ceil(selected as u128);
+    let selected = selected as u128;
+    let scaled = (nprobes as u128 * total as u128 + selected / 2) / selected;
     scaled.clamp(nprobes as u128, partitions.max(nprobes) as u128) as usize
 }
 
@@ -8719,6 +8721,8 @@ mod test {
         assert_eq!(prefilter_scaled_nprobes(20, 447, 0, 200_000), 447);
         // Never fewer probes than requested.
         assert_eq!(prefilter_scaled_nprobes(20, 10, 100, 200_000), 20);
+        // A barely selective filter keeps the requested probes.
+        assert_eq!(prefilter_scaled_nprobes(1, 2, 390, 400), 1);
     }
 
     #[test]
