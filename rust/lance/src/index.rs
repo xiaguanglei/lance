@@ -101,7 +101,9 @@ use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::dataset::transaction::{Operation, ReadVersionState, Transaction, TransactionBuilder};
 pub use crate::index::api::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
-use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_index};
+use crate::index::frag_reuse::{
+    ResolvedRemapping, load_frag_reuse_index_details, open_frag_reuse_index,
+};
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
@@ -1120,6 +1122,44 @@ impl CacheKey for LegacyVectorIndexCacheKey<'_> {
 
     fn write_key(&self, builder: &mut KeyBuilder) {
         write_index_identity(builder, self.uuid, self.fri_uuid);
+    }
+}
+
+/// Identifies a reconstructed v0.3+ vector index in a dataset handle's
+/// [`OpenedVectorIndices`](crate::dataset::OpenedVectorIndices).
+///
+/// The index's file readers are bound to the object store that opened them,
+/// so the key names that store; the map keeps the index (and so the store)
+/// alive, so no other store can take over the address while it is listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct OpenedVectorIndexKey {
+    uuid: Uuid,
+    fri_uuid: Option<Uuid>,
+    /// Translation fingerprint of a tagged-history remapping, which the
+    /// reconstructed storage applies to every row it returns.
+    translation: Option<[u8; 32]>,
+    object_store: usize,
+}
+
+/// Bound on the indices one handle keeps reconstructed; optimizing replaces
+/// segments, so a long-lived handle would otherwise keep superseded ones.
+const MAX_OPENED_VECTOR_INDICES: usize = 64;
+
+impl Dataset {
+    fn opened_vector_index(&self, key: &OpenedVectorIndexKey) -> Option<Arc<dyn VectorIndex>> {
+        self.opened_vector_indices
+            .lock()
+            .ok()
+            .and_then(|opened| opened.get(key).cloned())
+    }
+
+    fn keep_opened_vector_index(&self, key: OpenedVectorIndexKey, index: &Arc<dyn VectorIndex>) {
+        if let Ok(mut opened) = self.opened_vector_indices.lock() {
+            if opened.len() >= MAX_OPENED_VECTOR_INDICES && !opened.contains_key(&key) {
+                opened.clear();
+            }
+            opened.insert(key, index.clone());
+        }
     }
 }
 
@@ -3431,23 +3471,41 @@ impl DatasetIndexInternalExt for Dataset {
         // rewrites. Partitions decoded through a translating remapper live in
         // the translated namespace of `query_cache`.
         let frag_reuse_uuid = frag_reuse::fri_cache_id(&resolved).copied();
+        let translation = match &resolved {
+            Some((_, ResolvedRemapping::V1Translate { fingerprint, .. })) => Some(*fingerprint),
+            _ => None,
+        };
         let query_cache = frag_reuse::scoped_index_cache(self, &resolved);
         let remapping = resolved.map(|(_, remapping)| remapping);
+
+        // Reconstructing binds a scheduler and both index files to the store, which
+        // costs more than a small search; reuse it while this handle keeps the store.
+        let opened_key = OpenedVectorIndexKey {
+            uuid: *uuid,
+            fri_uuid: frag_reuse_uuid,
+            translation,
+            object_store: Arc::as_ptr(&object_store) as usize,
+        };
+        if let Some(opened) = self.opened_vector_index(&opened_key) {
+            return Ok(opened);
+        }
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = query_cache.for_index(uuid, frag_reuse_uuid.as_ref());
-            return entry
+            let index = entry
                 .0
                 .reconstruct(
-                    object_store,
+                    object_store.clone(),
                     self.metadata_cache.as_ref(),
                     partition_cache,
                     remapping,
                 )
-                .await;
+                .await?;
+            self.keep_opened_vector_index(opened_key, &index);
+            return Ok(index);
         }
 
         // Fallback: in-memory cache for legacy indices.
@@ -3736,6 +3794,7 @@ impl DatasetIndexInternalExt for Dataset {
             self.index_cache
                 .insert_with_key(&state_key, Arc::new(ivf_entry))
                 .await;
+            self.keep_opened_vector_index(opened_key, &index);
         } else {
             self.index_cache
                 .insert_with_key(&cache_key, Arc::new(CachedLegacyVectorIndex(index.clone())))

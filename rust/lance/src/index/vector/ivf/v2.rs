@@ -9348,6 +9348,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_reconstructed_vector_index_is_reused_per_object_store() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let (mut dataset, vectors) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("reuse_idx".to_owned()),
+                &VectorIndexParams::ivf_flat(4, DistanceType::L2),
+                true,
+            )
+            .await
+            .unwrap();
+        let uuid = dataset.load_indices_by_name("reuse_idx").await.unwrap()[0].uuid;
+        let search = |dataset: Dataset| {
+            let query = vectors.value(0);
+            async move {
+                let batch = dataset
+                    .scan()
+                    .nearest("vector", &query, 10)
+                    .unwrap()
+                    .minimum_nprobes(4)
+                    .with_row_id()
+                    .try_into_batch()
+                    .await
+                    .unwrap();
+                batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec()
+            }
+        };
+
+        // Clones share the handle's reconstructed index instead of rebinding
+        // fresh readers for every query.
+        let dataset = crate::DatasetBuilder::from_uri(test_uri)
+            .load()
+            .await
+            .unwrap();
+        let first = dataset
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let again = dataset
+            .clone()
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+
+        // Another object store binding reconstructs readers bound to its store
+        // from the shared state, without adding session cache entries.
+        let entries = dataset.session().index_cache_stats().await.num_entries;
+        let rebound =
+            dataset.with_object_store(Arc::new(dataset.object_store.as_ref().clone()), None);
+        let other = rebound
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(
+            dataset.session().index_cache_stats().await.num_entries,
+            entries
+        );
+        assert_eq!(search(dataset).await, search(rebound).await);
+    }
+
     #[rstest]
     #[case::v3(IndexFileVersion::V3)]
     #[case::legacy(IndexFileVersion::Legacy)]
