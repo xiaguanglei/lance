@@ -146,7 +146,7 @@ impl std::ops::BitOrAssign<&Self> for NullableRowAddrSet {
 /// This mask handles three-valued logic for SQL expressions, where a filter can
 /// evaluate to TRUE, FALSE, or NULL. The `selected` set includes rows that are
 /// TRUE or NULL. The `nulls` set includes rows that are NULL.
-#[derive(Clone, Debug, PartialEq, DeepSizeOf)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum NullableRowAddrMask {
     AllowList(NullableRowAddrSet),
     BlockList(NullableRowAddrSet),
