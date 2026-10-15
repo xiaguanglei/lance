@@ -252,20 +252,11 @@ pub struct Dataset {
     /// Object stores for additional base paths, normally shared across clones.
     /// Applying new object store wrappers starts a fresh cache scope.
     pub(crate) base_object_stores: BaseObjectStores,
-    /// Vector indices reconstructed through this handle's object stores, shared
-    /// across clones; a new object store binding starts an empty scope.
-    pub(crate) opened_vector_indices: OpenedVectorIndices,
 }
 
 /// The `OnceCell` coalesces concurrent first resolutions into one build.
 pub(crate) type BaseObjectStores =
     Arc<std::sync::Mutex<HashMap<u32, Arc<tokio::sync::OnceCell<Arc<ObjectStore>>>>>>;
-
-pub(crate) type OpenedVectorIndices = Arc<
-    std::sync::Mutex<
-        HashMap<crate::index::OpenedVectorIndexKey, Arc<dyn lance_index::vector::VectorIndex>>,
-    >,
->;
 
 impl std::fmt::Debug for Dataset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -956,7 +947,6 @@ impl Dataset {
             store_params: store_params.map(Box::new),
             base_store_params,
             base_object_stores: Default::default(),
-            opened_vector_indices: Default::default(),
         })
     }
 
@@ -2085,7 +2075,6 @@ impl Dataset {
         let mut cloned = self.clone();
         cloned.object_store = object_store;
         cloned.base_object_stores = Default::default();
-        cloned.opened_vector_indices = Default::default();
         if let Some(store_params) = store_params {
             cloned.store_params = Some(Box::new(store_params));
         }
@@ -2111,7 +2100,6 @@ impl Dataset {
         // stores alive within the derived dataset without sharing stateful
         // provider layers (such as an AIMD throttle) with other scopes.
         cloned.base_object_stores = Default::default();
-        cloned.opened_vector_indices = Default::default();
         let mut object_store = self.object_store.as_ref().clone();
         for wrapper in &wrappers {
             object_store.apply_wrapper(wrapper.as_ref());
