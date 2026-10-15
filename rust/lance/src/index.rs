@@ -7,7 +7,7 @@
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use arrow_schema::DataType;
@@ -3058,30 +3058,7 @@ pub(crate) fn unsupported_index_version(index: &IndexMetadata) -> Option<u32> {
 /// indices need both a reader for their exact declared type and a supported
 /// format version.
 pub(crate) fn index_is_usable(index: &IndexMetadata) -> bool {
-    let Some(details) = index.index_details.as_ref() else {
-        return index_type_is_known(index) && unsupported_index_version(index).is_none();
-    };
-    // Both checks depend only on the declared type, and this build's readers are
-    // fixed, so the answer is memoized per type: `load_indices` filters every
-    // index on every call, and query planning calls it many times per query.
-    static SUPPORT: LazyLock<std::sync::RwLock<HashMap<String, (bool, u32)>>> =
-        LazyLock::new(Default::default);
-    let cached = SUPPORT
-        .read()
-        .ok()
-        .and_then(|support| support.get(&details.type_url).copied());
-    let (has_reader, max_version) = cached.unwrap_or_else(|| {
-        let details = IndexDetails(details.clone());
-        let support = (
-            details.has_reader(),
-            details.index_version().unwrap_or(i32::MAX as u32),
-        );
-        if let Ok(mut memo) = SUPPORT.write() {
-            memo.insert(details.0.type_url.clone(), support);
-        }
-        support
-    });
-    (is_system_index(index) || has_reader) && index.index_version <= max_version as i32
+    index_type_is_known(index) && unsupported_index_version(index).is_none()
 }
 
 /// Name the indices this build has no reader for, once per manifest read.
